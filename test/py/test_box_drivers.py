@@ -47,6 +47,29 @@ class InstaboxTimes(unittest.TestCase):
         self.assertEqual(ib.box_times({"state": "stopped", "cooldownUntil": "2026-11-25T23:59:00Z"}, self.now)["cooldown_s"], 0)
 
 
+class BoxctlGjcSha(unittest.TestCase):
+    """rt-boxctl은 박스 플랫폼의 공식 해시를 골라 gjc-<플랫폼>을 받는다."""
+    def test_pick_sha_by_platform(self):
+        from unittest import mock
+        loader = importlib.machinery.SourceFileLoader("rt_boxctl", os.path.join(HERE, "..", "..", "worker", "box", "rt-boxctl"))
+        spec = importlib.util.spec_from_loader("rt_boxctl", loader)
+        bc = importlib.util.module_from_spec(spec)
+        loader.exec_module(bc)
+        a, b = "a" * 64, "b" * 64
+        shas = f"linux-x64={a},linux-arm64={b}"
+        for machine, want in (("x86_64", ("linux-x64", a)), ("aarch64", ("linux-arm64", b))):
+            with mock.patch.object(bc.os, "uname", return_value=os.uname_result(("Linux", "h", "r", "v", machine))):
+                self.assertEqual(bc.pick_sha(shas), want)
+        with mock.patch.object(bc.os, "uname", return_value=os.uname_result(("Linux", "h", "r", "v", "aarch64"))):
+            with self.assertRaises(bc.BoxError) as e:
+                bc.pick_sha(f"linux-x64={a}")
+            self.assertEqual(e.exception.code, "gjc_platform_unsupported")
+        for bad in ("", a, f"linux-x64={a};rm", f"darwin-arm64={a}"):
+            with self.assertRaises(bc.BoxError):
+                bc.pick_sha(bad)
+        self.assertIn("gjc-{platform}", bc.GJC_URL)
+
+
 FAKE_SSH = r"""#!/bin/bash
 # 가짜 ssh: 옵션을 건너뛰고 원격 명령을 로컬 bash로 돌린다(/data/workspace → $FAKE_WS).
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done

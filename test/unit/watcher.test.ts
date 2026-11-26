@@ -14,6 +14,7 @@ const config: RtConfig = {
 	targets: { lab: { kind: "ssh", host: "l", user: "u", port: 22, maxSlots: 3, loadMax: 0.7 } },
 	gjcVersion: "0.22.0",
 	gjcBinary: "/x",
+	gjcBinaries: {},
 	defaultModel: "oci-opencodex/devin/swe-2:high",
 	rtKey: { allowedModels: ["oci-opencodex/devin/swe-2"] },
 	thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },

@@ -116,6 +116,7 @@ describe("rules", () => {
 		},
 		gjcVersion: "0.22.0",
 		gjcBinary: "/x",
+		gjcBinaries: {},
 		defaultModel: "oci-opencodex/devin/swe-2:high",
 		rtKey: { allowedModels: ["oci-opencodex/devin/swe-2"] },
 		thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },
@@ -123,7 +124,7 @@ describe("rules", () => {
 		sshConnectTimeoutS: 10,
 		box: { hubBase: "http://h/v1", keyFile: "" },
 	};
-	const ok = { snapshot: { load_ratio: 0.1, mem_avail_ratio: 0.5, disk_free_gb: 50 }, slots_used: 0, slots_max: 3, load_max: 0.7, credential: true, trusted_gjc: ["0.22.0"], model_rejection: null };
+	const ok = { snapshot: { load_ratio: 0.1, mem_avail_ratio: 0.5, disk_free_gb: 50 }, slots_used: 0, slots_max: 3, load_max: 0.7, credential: true, trusted_gjc: ["0.22.0"], platform: "linux-x64", model_rejection: null };
 	const base = { config, local: { load1: 1, ncpu: 4, memAvailRatio: 0.5 }, model: "oci-opencodex/devin/swe-2:high", repo: { dirty: false, submodules: false }, localLive: {} };
 
 	test("임계값 0.8·20%에서 원격을 권장한다", () => {
@@ -151,6 +152,14 @@ describe("rules", () => {
 		expect(out.rejections.lab).toContain("model_not_allowed");
 		expect(out.rejections.pve2).toContain("model_not_allowed");
 		expect(out.noTarget).toBe(true);
+	});
+	test("작업 호스트 플랫폼: x64·arm64 리눅스는 받고 그 밖은 탈락", () => {
+		const out = evaluate({ ...base, probes: { lab: { ...ok, platform: "linux-arm64" }, pve2: { ...ok, platform: "linux-riscv64" } } });
+		expect(out.rejections.lab).toBeUndefined();
+		expect(out.rejections.pve2).toEqual(["gjc_platform_unsupported"]);
+		expect(out.recommended).toBe("lab");
+		const { platform: _, ...old } = ok;
+		expect(evaluate({ ...base, probes: { lab: old, pve2: ok } }).rejections.lab).toEqual(["worker_outdated"]);
 	});
 	test("대상 admission 사유(경합 slice·PSI)를 그대로 싣는다", () => {
 		const out = evaluate({ ...base, probes: { lab: ok, pve2: { ...ok, admission: ["contention:ptj.slice"] } } });
@@ -312,6 +321,7 @@ describe("box rules", () => {
 		},
 		gjcVersion: "0.22.0",
 		gjcBinary: "/x",
+		gjcBinaries: {},
 		defaultModel: "oci-opencodex/devin/swe-2:high",
 		rtKey: { allowedModels: ["oci-opencodex/devin/swe-2"] },
 		thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },
@@ -319,7 +329,7 @@ describe("box rules", () => {
 		sshConnectTimeoutS: 10,
 		box: { hubBase: "http://h/v1", keyFile: "" },
 	};
-	const lab = { snapshot: { load_ratio: 0.1, mem_avail_ratio: 0.5, disk_free_gb: 50 }, slots_used: 0, slots_max: 3, credential: true, trusted_gjc: ["0.22.0"], model_rejection: null };
+	const lab = { snapshot: { load_ratio: 0.1, mem_avail_ratio: 0.5, disk_free_gb: 50 }, slots_used: 0, slots_max: 3, credential: true, trusted_gjc: ["0.22.0"], platform: "linux-x64", model_rejection: null };
 	const box = { slots_used: 0, slots_max: 1, credential: true, trusted_gjc: ["0.22.0"], model_rejection: null, admission: [] as string[] };
 	const base = { config, local: { load1: 1, ncpu: 4, memAvailRatio: 0.5 }, model: "oci-opencodex/devin/swe-2:high", repo: { dirty: false, submodules: false }, localLive: {} };
 	test("박스는 스냅샷 없이 후보가 되고, 비공개 원본은 박스에만 사유가 붙는다", () => {

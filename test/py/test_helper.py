@@ -106,5 +106,26 @@ class ReclaimTest(unittest.TestCase):
                 h.STATE, h.unit_show, h.boot_id, h.seal, h.meta_update = orig
 
 
+class GjcTrustTest(unittest.TestCase):
+    def test_host_platform_uses_release_asset_names(self):
+        from unittest import mock
+        for machine, want in (("x86_64", "linux-x64"), ("aarch64", "linux-arm64"), ("arm64", "linux-arm64")):
+            with mock.patch.object(h.os, "uname", return_value=os.uname_result(("Linux", "h", "r", "v", machine))):
+                self.assertEqual(h.host_platform(), want)
+
+    def test_trusted_table_reads_only_own_platform(self):
+        a, b = "a" * 64, "b" * 64
+        table = f"0.22.1 linux-x64 {a}\n0.22.1 linux-arm64 {b}\n0.22.0 {a}\n0.21.0 linux-arm64 bad\n"
+        orig = h.read_root_file, h.host_platform
+        h.read_root_file = lambda p: table
+        try:
+            h.host_platform = lambda: "linux-arm64"
+            self.assertEqual(h.trusted_gjc(), {"0.22.1": b})  # 두 칸 옛 형식·잘못된 해시는 버린다
+            h.host_platform = lambda: "linux-x64"
+            self.assertEqual(h.trusted_gjc(), {"0.22.1": a})
+        finally:
+            h.read_root_file, h.host_platform = orig
+
+
 if __name__ == "__main__":
     unittest.main()

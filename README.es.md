@@ -53,10 +53,22 @@ Una extensión de [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`
 
 ## Requisitos
 
-- **Origen:** `gjc` ≥ 0.22 con Bun, `git`, `ssh` y Python 3.10+.
-- **Host de trabajo:** Linux con systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (por la regla con expresión regular), `git` y Python 3.10+. Misma arquitectura de CPU que el origen, porque el origen sube su propio binario de `gjc` y el host lo verifica contra un SHA-256 fijado. Desarrollado en Debian 13.
+- **Origen:** `gjc` ≥ 0.22 con Bun, `git`, `ssh` y Python 3.10+. Desarrollado y probado en Linux. Un origen macOS debería funcionar con hosts de trabajo SSH, pero no se ha probado. Los boxes requieren un origen Linux, porque la bomba del box se ejecuta como una unidad systemd aislada.
+- **Host de trabajo:** Linux con systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (por la regla con expresión regular), `git` y Python 3.10+. x86_64 o aarch64. El host nunca descarga `gjc` por sí mismo: el origen sube un binario para la plataforma del host y el host lo verifica contra un SHA-256 fijado. Desarrollado en Debian 13. Consulta [Arquitecturas de CPU distintas](#arquitecturas-de-cpu-distintas).
 - **Hub de modelos:** un endpoint de modelos compatible con OpenAI y una clave de API dedicada a los hosts de trabajo que solo permita los modelos que indiques.
-- **Box (opcional):** una VM Linux x86_64 con systemd, `sudo` sin contraseña para la cuenta de acceso, `python3`, `git`, `curl` y `tar`. El driver `ssh` solo necesita `ssh` en el origen y la clave de host de la VM en `~/.ssh/known_hosts`. El driver `instabox` necesita la CLI `instabox` y una herramienta de cola `instabox-q`, que no forma parte de este repositorio. Consulta [worker/box/drivers/README.md](worker/box/drivers/README.md).
+- **Box (opcional):** una VM Linux x86_64 o aarch64 con systemd, `sudo` sin contraseña para la cuenta de acceso, `python3`, `git`, `curl` y `tar`. El driver `ssh` solo necesita `ssh` en el origen y la clave de host de la VM en `~/.ssh/known_hosts`. El driver `instabox` necesita la CLI `instabox` y una herramienta de cola `instabox-q`, que no forma parte de este repositorio. Consulta [worker/box/drivers/README.md](worker/box/drivers/README.md).
+
+## Arquitecturas de CPU distintas
+
+El origen y un host de trabajo pueden usar arquitecturas de CPU distintas, por ejemplo un origen x86_64 con un servidor aarch64, o un origen Apple Silicon con servidores x86_64. Para cada plataforma de host o box, el origen elige el binario de `gjc` en este orden:
+
+1. El archivo indicado en `gjcBinaries` de `config.yml`, por ejemplo `gjcBinaries: { linux-arm64: ~/bin/gjc-arm64 }`.
+2. El `gjcBinary` propio del origen, si la plataforma coincide.
+3. El binario oficial de la misma versión publicado en `Yeachan-Heo/gajae-code`. El origen lo descarga por HTTPS, lo comprueba con `gajae-release-binaries.sha256` de la versión y lo guarda en caché en `~/.gjc/agent/remote-task/gjc/<versión>/`. Solo lo hace si el binario propio del origen coincide con el hash oficial de su plataforma. Una compilación propia falla con `gjc_custom_build`; en ese caso usa `gjcBinaries`.
+
+Los hosts registran los binarios de confianza por plataforma en `trusted-gjc.sha256` (`<versión> <plataforma> <sha256>`). Los hosts preparados con una versión anterior de este repositorio usan otro formato, así que vuelve a ejecutar `stage-worker.sh` en ellos. Los boxes descargan `gjc-<plataforma>` de la versión por sí mismos y lo comprueban con los hashes por plataforma que pasa el origen.
+
+Probado: la consulta de la versión y la comprobación del hash, y la ejecución del `gjc-linux-arm64` descargado en un host aarch64. No se ha ejecutado un trabajo completo en un host aarch64.
 
 ## Instalación
 

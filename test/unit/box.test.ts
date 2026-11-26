@@ -13,6 +13,7 @@ const config: RtConfig = {
 	targets: { box2: { kind: "box", driver: "ssh", host: "203.0.113.10", maxSlots: 1 } },
 	gjcVersion: "0.22.0",
 	gjcBinary: "/x",
+	gjcBinaries: {},
 	defaultModel: "my-hub/my-model:high",
 	rtKey: { allowedModels: ["my-hub/my-model"] },
 	thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },

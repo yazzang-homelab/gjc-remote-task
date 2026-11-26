@@ -53,10 +53,22 @@
 
 ## 环境要求
 
-- **origin**：`gjc` 0.22 或更高版本以及 Bun、`git`、`ssh`、Python 3.10+。
-- **工作主机**：带 systemd（cgroup v2）的 Linux、OpenSSH、`sudo` 1.9.10+（用于正则规则）、`git`、Python 3.10+。CPU 架构需与 origin 相同，因为 origin 会上传自己的 `gjc` 可执行文件，工作主机用固定的 SHA-256 校验它。开发环境为 Debian 13。
+- **origin**：`gjc` 0.22 或更高版本以及 Bun、`git`、`ssh`、Python 3.10+。在 Linux 上开发和测试。macOS origin 理论上可用于 SSH 工作主机，但未经测试。box 的 pump 以沙箱化的 systemd 单元运行，因此 box 只能从 Linux origin 使用。
+- **工作主机**：带 systemd（cgroup v2）的 Linux、OpenSSH、`sudo` 1.9.10+（用于正则规则）、`git`、Python 3.10+。x86_64 或 aarch64。工作主机不会自己下载 `gjc`：origin 上传与工作主机平台匹配的可执行文件，工作主机用固定的 SHA-256 校验它。开发环境为 Debian 13。参见[CPU 架构不同时](#cpu-架构不同时)。
 - **模型 hub**：一个兼容 OpenAI 的模型端点，以及一个只允许指定模型的工作主机专用 API 密钥。
-- **box（可选）**：带 systemd 的 x86_64 Linux 虚拟机，登录账号需要免密码 `sudo`，并装有 `python3`、`git`、`curl` 和 `tar`。`ssh` 驱动在 origin 上只需要 `ssh`，并需事先把虚拟机的主机密钥加入 `~/.ssh/known_hosts`。`instabox` 驱动需要 `instabox` CLI 和 `instabox-q` 队列工具，后者不包含在本仓库中。详见 [worker/box/drivers/README.md](worker/box/drivers/README.md)。
+- **box（可选）**：带 systemd 的 x86_64 或 aarch64 Linux 虚拟机，登录账号需要免密码 `sudo`，并装有 `python3`、`git`、`curl` 和 `tar`。`ssh` 驱动在 origin 上只需要 `ssh`，并需事先把虚拟机的主机密钥加入 `~/.ssh/known_hosts`。`instabox` 驱动需要 `instabox` CLI 和 `instabox-q` 队列工具，后者不包含在本仓库中。详见 [worker/box/drivers/README.md](worker/box/drivers/README.md)。
+
+## CPU 架构不同时
+
+origin 与工作主机的 CPU 架构可以不同，例如 x86_64 origin 搭配 aarch64 服务器，或 Apple Silicon origin 搭配 x86_64 服务器。origin 为每个工作主机或 box 平台按以下顺序选择 `gjc` 可执行文件：
+
+1. `config.yml` 中 `gjcBinaries` 指定的文件，例如 `gjcBinaries: { linux-arm64: ~/bin/gjc-arm64 }`。
+2. 平台相同时使用 origin 自己的 `gjcBinary`。
+3. `Yeachan-Heo/gajae-code` 同一版本的官方发布文件。origin 通过 HTTPS 下载，与发布中的 `gajae-release-binaries.sha256` 比对，并缓存到 `~/.gjc/agent/remote-task/gjc/<版本>/`。仅当 origin 自己的可执行文件与其平台的官方哈希一致时才这样做；自行构建的 gjc 会以 `gjc_custom_build` 拒绝，请改用 `gjcBinaries`。
+
+工作主机按平台在 `trusted-gjc.sha256`（`<版本> <平台> <sha256>`）中记录可信的可执行文件。用本仓库旧版本准备的工作主机格式不同，需要重新运行 `stage-worker.sh`。box 自己从发布下载 `gjc-<平台>`，并用 origin 传入的各平台哈希校验。
+
+已测试：发布查询与哈希校验，以及在 aarch64 主机上运行下载的 `gjc-linux-arm64`。尚未在 aarch64 工作主机上跑完整任务。
 
 ## 安装
 

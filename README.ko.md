@@ -53,10 +53,22 @@
 
 ## 요구 사항
 
-- **원점**: `gjc` 0.22 이상과 Bun, `git`, `ssh`, Python 3.10 이상.
-- **작업 호스트**: systemd(cgroup v2)가 있는 Linux, OpenSSH, `sudo` 1.9.10 이상(정규식 규칙), `git`, Python 3.10 이상. 원점과 CPU 아키텍처가 같아야 합니다. 원점이 자기 `gjc` 실행 파일을 올리고, 작업 호스트가 고정된 SHA-256으로 확인하기 때문입니다. Debian 13에서 개발했습니다.
+- **원점**: `gjc` 0.22 이상과 Bun, `git`, `ssh`, Python 3.10 이상. 리눅스에서 개발하고 시험했습니다. macOS 원점은 SSH 작업 호스트에 쓸 수 있도록 만들었지만 시험하지 않았습니다. 박스 pump가 샌드박스된 systemd 유닛으로 돌기 때문에 박스는 리눅스 원점에서만 씁니다.
+- **작업 호스트**: systemd(cgroup v2)가 있는 Linux, OpenSSH, `sudo` 1.9.10 이상(정규식 규칙), `git`, Python 3.10 이상. x86_64 또는 aarch64. 작업 호스트는 `gjc`를 직접 내려받지 않습니다. 원점이 작업 호스트 플랫폼에 맞는 실행 파일을 올리고, 작업 호스트가 고정된 SHA-256으로 확인합니다. Debian 13에서 개발했습니다. [CPU 아키텍처가 다를 때](#cpu-아키텍처가-다를-때)를 보세요.
 - **모델 허브**: OpenAI 호환 모델 엔드포인트와, 정한 모델만 허용하는 작업 호스트 전용 API 키.
-- **박스(선택)**: systemd가 있는 x86_64 리눅스 VM. 접속 계정의 비밀번호 없는 `sudo`, `python3`·`git`·`curl`·`tar`가 필요합니다. `ssh` 드라이버는 원점에 `ssh`만 있으면 되고, VM 호스트 키를 `~/.ssh/known_hosts`에 미리 넣어 둡니다. `instabox` 드라이버는 `instabox` CLI와 `instabox-q` 대기줄 도구가 필요하며, `instabox-q`는 이 저장소에 없습니다. 자세한 내용은 [worker/box/drivers/README.md](worker/box/drivers/README.md)를 보세요.
+- **박스(선택)**: systemd가 있는 x86_64 또는 aarch64 리눅스 VM. 접속 계정의 비밀번호 없는 `sudo`, `python3`·`git`·`curl`·`tar`가 필요합니다. `ssh` 드라이버는 원점에 `ssh`만 있으면 되고, VM 호스트 키를 `~/.ssh/known_hosts`에 미리 넣어 둡니다. `instabox` 드라이버는 `instabox` CLI와 `instabox-q` 대기줄 도구가 필요하며, `instabox-q`는 이 저장소에 없습니다. 자세한 내용은 [worker/box/drivers/README.md](worker/box/drivers/README.md)를 보세요.
+
+## CPU 아키텍처가 다를 때
+
+원점과 작업 호스트의 CPU 아키텍처가 달라도 됩니다. 예를 들어 x86_64 원점과 aarch64 서버, Apple Silicon 원점과 x86_64 서버입니다. 원점은 작업 호스트·박스 플랫폼마다 이 순서로 `gjc` 실행 파일을 고릅니다.
+
+1. `config.yml`의 `gjcBinaries`에 적은 파일. 예: `gjcBinaries: { linux-arm64: ~/bin/gjc-arm64 }`.
+2. 플랫폼이 같으면 원점의 `gjcBinary`.
+3. `Yeachan-Heo/gajae-code`의 같은 판 공식 릴리스 실행 파일. 원점이 HTTPS로 받아 릴리스의 `gajae-release-binaries.sha256`과 대조하고 `~/.gjc/agent/remote-task/gjc/<판>/`에 캐시합니다. 원점 자신의 실행 파일이 자기 플랫폼의 공식 해시와 같을 때만 이렇게 합니다. 직접 빌드한 gjc면 `gjc_custom_build`로 거절하니 `gjcBinaries`를 적으세요.
+
+작업 호스트는 믿는 실행 파일을 플랫폼별로 `trusted-gjc.sha256`(`<판> <플랫폼> <sha256>`)에 적습니다. 이 저장소의 이전 판으로 준비한 작업 호스트는 형식이 달라 `stage-worker.sh`를 다시 돌려야 합니다. 박스는 릴리스에서 `gjc-<플랫폼>`을 직접 받고, 원점이 넘긴 플랫폼별 해시로 확인합니다.
+
+시험한 것: 릴리스 조회와 해시 대조, 받은 `gjc-linux-arm64`를 aarch64 호스트에서 실행. aarch64 작업 호스트에서 잡 전체를 돌려 보지는 않았습니다.
 
 ## 설치
 

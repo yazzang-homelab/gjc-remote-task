@@ -6,6 +6,8 @@
 # 결과: ~/.gjc/agent/remote-task/box/{bundle-<판>.tar, rt-boxctl, job.sh.tmpl, rt-boxpump.py, rtlib.py, box.json, fingerprints.json,
 #        drivers/rt-box-<driver>}
 set -euo pipefail
+# pump를 systemd 유닛(샌드박스)으로 띄우므로 박스는 리눅스 원점에서만 쓴다.
+[ "$(uname -s)" = Linux ] || { echo "박스는 리눅스(systemd) 원점에서만 쓸 수 있다" >&2; exit 64; }
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 RT=${GJC_RT_HOME:-$HOME/.gjc/agent/remote-task}
 . "$HERE/deploy/lib.sh"
@@ -29,9 +31,9 @@ JSON
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --mode='u+rwX,go+rX,go-w' -C "$S/bundle" -cf "$S/bundle.tar" .
 TSHA=$(sha256sum "$S/bundle.tar" | cut -d' ' -f1)
 BVER=${TSHA:0:12}
-GJC_BIN=$(rt_cfg 'c.gjcBinary')
-GJC_SHA=$(sha256sum "$GJC_BIN" | cut -d' ' -f1)
-GJC_VER=$("$GJC_BIN" --version | sed 's#^gjc/##')
+# 박스는 공식 릴리스에서 gjc를 직접 받는다. 박스 플랫폼(x64·arm64)마다 그 판의 공식 해시를 넘긴다.
+GJC_VER=$(rt_cfg 'c.gjcVersion')
+GJC_SHAS=$(bun "$HERE/scripts/gjc-resolve.ts" "$RT" box-shas)
 install -m 0600 "$S/bundle.tar" "$RT/box/bundle-$BVER.tar"
 install -m 0700 "$HERE/worker/box/rt-boxctl" "$RT/box/rt-boxctl"
 install -m 0600 "$HERE/worker/box/job.sh.tmpl" "$RT/box/job.sh.tmpl"
@@ -43,7 +45,7 @@ for drv in "$HERE"/worker/box/drivers/rt-box-*; do install -m 0700 "$drv" "$RT/b
 BSHA=$(sha256sum "$RT/box/rt-boxctl" | cut -d' ' -f1)
 cat > "$RT/box/box.json.new" <<JSON
 {"bundle_ver": "$BVER", "bundle_tar": "bundle-$BVER.tar", "tar_sha": "$TSHA", "boxctl_sha": "$BSHA",
- "gjc_ver": "$GJC_VER", "gjc_sha": "$GJC_SHA"}
+ "gjc_ver": "$GJC_VER", "gjc_shas": "$GJC_SHAS"}
 JSON
 mv "$RT/box/box.json.new" "$RT/box/box.json"
 # 투입 전 검사용 실제 키 지문(원점에만 둔다. 박스로 보내지 않는다).

@@ -39,7 +39,8 @@ VER_RE = re.compile(r"[0-9a-f]{12}")
 GJC_VER_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}?(\.git)?")
-GJC_URL = "https://github.com/Yeachan-Heo/gajae-code/releases/download/v{ver}/gjc-linux-x64"
+GJC_URL = "https://github.com/Yeachan-Heo/gajae-code/releases/download/v{ver}/gjc-{platform}"
+SHAS_RE = re.compile(r"linux-(x64|arm64)=[0-9a-f]{64}(,linux-(x64|arm64)=[0-9a-f]{64})*")
 DISK_MIN_BYTES = int(1.5 * (1 << 30))
 KEEP_DAYS = 7
 SCOPE_PROPS = ["-p", "MemoryMax=6G", "-p", "TasksMax=2048", "-p", "KillMode=control-group"]
@@ -234,7 +235,24 @@ def install_bundle(src_tar: str, ver: str, tar_sha: str) -> None:
     os.rename(staging, dest)
 
 
-def install_gjc(ver: str, sha: str) -> None:
+def host_platform() -> str:
+    m = os.uname().machine.lower()
+    return "linux-" + {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m)
+
+
+def pick_sha(shas: str) -> tuple[str, str]:
+    """"linux-x64=<sha>,linux-arm64=<sha>"에서 이 박스 플랫폼의 공식 해시를 고른다."""
+    if not SHAS_RE.fullmatch(shas or ""):
+        raise BoxError("bad_argument", "gjc_shas")
+    table = dict(item.split("=", 1) for item in shas.split(","))
+    plat = host_platform()
+    if plat not in table:
+        raise BoxError("gjc_platform_unsupported", plat)
+    return plat, table[plat]
+
+
+def install_gjc(ver: str, shas: str) -> None:
+    plat, sha = pick_sha(shas)
     d = os.path.join(PUB, "gjc", ver)
     path = os.path.join(d, "gjc")
     if os.path.isfile(path) and sha256_file(path) == sha:
@@ -242,7 +260,7 @@ def install_gjc(ver: str, sha: str) -> None:
     os.makedirs(d, mode=0o755, exist_ok=True)
     os.chmod(d, 0o755)
     tmp = os.path.join(CTL, "tmp", f"gjc-{ver}")
-    with urllib.request.urlopen(GJC_URL.format(ver=ver), timeout=300) as r, open(tmp, "wb") as f:
+    with urllib.request.urlopen(GJC_URL.format(ver=ver, platform=plat), timeout=300) as r, open(tmp, "wb") as f:
         shutil.copyfileobj(r, f)
     if sha256_file(tmp) != sha:
         os.unlink(tmp)
@@ -254,14 +272,15 @@ def install_gjc(ver: str, sha: str) -> None:
 def v_setup(args: list[str]) -> None:
     if len(args) != 5:
         raise BoxError("bad_argument", "setup")
-    src_tar, ver, tar_sha, gjc_ver, gjc_sha = args
-    need("ver", ver); need("sha", tar_sha); need("gjc", gjc_ver); need("sha", gjc_sha)
+    src_tar, ver, tar_sha, gjc_ver, gjc_shas = args
+    need("ver", ver); need("sha", tar_sha); need("gjc", gjc_ver)
+    pick_sha(gjc_shas)  # 내려받기 전에 형식·플랫폼부터 본다
     ensure_dirs()
     if shutil.disk_usage("/data").free < DISK_MIN_BYTES:
         raise BoxError("disk_low")
     ensure_account()
     install_bundle(src_tar, ver, tar_sha)
-    install_gjc(gjc_ver, gjc_sha)
+    install_gjc(gjc_ver, gjc_shas)
     out({"ok": True, "bundle": ver, "gjc": gjc_ver, "disk_free_gb": round(shutil.disk_usage("/data").free / 1e9, 1)})
 
 

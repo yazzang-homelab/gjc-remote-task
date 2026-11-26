@@ -29,7 +29,8 @@ export interface BoxStaging {
 	tar_sha: string;
 	boxctl_sha: string;
 	gjc_ver: string;
-	gjc_sha: string;
+	/** 박스가 고를 플랫폼별 공식 해시: "linux-x64=<sha>,linux-arm64=<sha>" */
+	gjc_shas: string;
 }
 
 interface RunResult {
@@ -193,6 +194,8 @@ export class BoxTransport {
 	private async probe(a: string[]) {
 		const est = a.includes("--est") ? Number(a[a.indexOf("--est") + 1]) : 30;
 		const model = a.includes("--model") ? a[a.indexOf("--model") + 1]! : this.config.defaultModel;
+		// pump는 systemd 유닛(샌드박스)으로 돈다. systemd가 없는 원점(맥 등)은 박스를 쓰지 못한다.
+		if (!this.run && process.platform !== "linux") return { error: "box_origin_unsupported" };
 		if (!this.run && !existsSync(this.driverPath())) return { error: "box_driver_missing" };
 		const info = await this.boxes();
 		if (!info) return { error: "unreachable" };
@@ -245,7 +248,7 @@ export class BoxTransport {
 			.replaceAll("@BUNDLE_VER@", st.bundle_ver)
 			.replaceAll("@TAR_SHA@", st.tar_sha)
 			.replaceAll("@GJC_VER@", st.gjc_ver)
-			.replaceAll("@GJC_SHA@", st.gjc_sha);
+			.replaceAll("@GJC_SHAS@", st.gjc_shas);
 		if (/@[A-Z_]+@/.test(script)) throw new RemoteError("template_incomplete");
 		writeFileSync(join(d, "job.sh"), script, { mode: 0o600 });
 		const r = await this.q(["put", up, `/data/workspace/rt-in/${job}`], 30 * 60_000);

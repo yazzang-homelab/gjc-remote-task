@@ -50,19 +50,24 @@ PY
 { read -r PROV; read -r IDS; read -r BASE; } < "$S/template.args"
 rm -f "$S/template.args"
 rt_render_template "$S/bundle" "$PROV" "$IDS" "$BASE"
-BVER=$(cd "$S/bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)
+BVER=$(rt_tree_hash "$S/bundle" | cut -c1-12)
 echo "$BVER" > "$S/bundle.version"
 cp "$HERE/deploy/profiles/$PROFILE.slice.conf" "$S/slice.conf"
-GJC_BIN=$(rt_cfg 'c.gjcBinary')
-GJC_SHA=$(sha256sum "$GJC_BIN" | cut -d' ' -f1)
-GJC_VER=$("$GJC_BIN" --version | sed 's#^gjc/##')
-echo "$GJC_VER $GJC_SHA" > "$S/trusted-gjc.sha256"
+# 대상 플랫폼(linux-x64·linux-arm64)에 맞는 gjc를 확장과 같은 규칙으로 고른다. 원점과 다르면 공식 릴리스에서 받아 둔다.
+TPLAT=$(ssh -o BatchMode=yes "$SSH_ALIAS" 'uname -sm' | python3 -c 'import sys
+s, m = (sys.stdin.read().split() + ["", ""])[:2]
+a = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(m.lower())
+print(f"linux-{a}" if s == "Linux" and a else "")')
+[ -n "$TPLAT" ] || { echo "대상이 지원하지 않는 플랫폼이다(리눅스 x86_64·aarch64만)" >&2; exit 64; }
+TRUSTED=$(bun "$HERE/scripts/gjc-resolve.ts" "$RT" trusted "$TPLAT")
+GJC_VER=${TRUSTED%% *}
+echo "$TRUSTED" > "$S/trusted-gjc.sha256"
 # 비밀 지문(이름·길이·sha256). 값도 원문 조각도 보내지 않는다. 결과·로그·이벤트에 이 값이 섞이면 원격에서 막는다.
 rt_fingerprints > "$S/fingerprints.json"
 [ -n "${RT_EXTRA_SETUP:-}" ] && cp "$RT_EXTRA_SETUP" "$S/extra-setup.sh"
 THOST=$(rt_cfg "c.targets['$TARGET']?.host")
 [ -n "$THOST" ] || { echo "config.yml에 ssh 대상이 없다: $TARGET" >&2; exit 64; }
-if [ -z "${RT_FROM:-}" ] && [[ "$THOST" == fe80:*%* ]]; then
+if [ -z "${RT_FROM:-}" ] && [[ "$THOST" == fe80:*%* ]] && command -v ip >/dev/null 2>&1; then
   LL=$(ip -6 -o addr show dev "${THOST##*%}" scope link | awk '{print $4}' | cut -d/ -f1 | head -1)
   [ -n "$LL" ] || { echo "링크로컬 주소를 못 찾았다: ${THOST##*%}" >&2; exit 1; }
   RT_FROM="$LL*"
@@ -90,4 +95,4 @@ touch "$RT/known_hosts"
 grep -v "^\[$TH\]:$TP \|^$TH " "$RT/known_hosts" > "$RT/known_hosts.new" || true
 if [ "$TP" = 22 ]; then echo "$TH $KEYS" >> "$RT/known_hosts.new"; else echo "[$TH]:$TP $KEYS" >> "$RT/known_hosts.new"; fi
 mv "$RT/known_hosts.new" "$RT/known_hosts"
-echo "staged target=$TARGET bundle=$BVER gjc=$GJC_VER fingerprints=$(python3 -c "import json;print(len(json.load(open('$S/fingerprints.json'))))" 2>/dev/null || echo ?)"
+echo "staged target=$TARGET platform=$TPLAT bundle=$BVER gjc=$GJC_VER fingerprints=$(python3 -c "import json;print(len(json.load(open('$S/fingerprints.json'))))" 2>/dev/null || echo ?)"

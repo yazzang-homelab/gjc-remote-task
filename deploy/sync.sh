@@ -10,13 +10,13 @@ if [ "${1:-}" = "--check" ]; then CHECK=1; shift; fi
 HOSTS=("$@"); [ ${#HOSTS[@]} -eq 0 ] && HOSTS=("$(hostname -s)")
 SELF=$(hostname -s)
 DEST=${RT_SYNC_DEST:-'$HOME/.gjc/agent/extensions/remote-task'}
+. "$HERE/deploy/lib.sh"
 
 # 판 = extension/ 아래 .ts 파일 목록과 내용의 sha256
-manifest() { (cd "$HERE/extension" && find . -type f -name '*.ts' -print0 | sort -z | xargs -0 sha256sum); }
-WANT=$(manifest | sha256sum | cut -c1-16)
+WANT=$(rt_tree_hash "$HERE/extension" .ts | cut -c1-16)
 remote_ver() { # 호스트
-  local cmd="cd $DEST 2>/dev/null && find . -type f -name '*.ts' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16 || echo none"
-  if [ "$1" = "$SELF" ]; then bash -c "$cmd"; else ssh -o BatchMode=yes "$1" "$cmd" 2>/dev/null; fi
+  local cmd="[ -d \"$DEST\" ] && python3 - \"$DEST\" .ts | cut -c1-16 || echo none"
+  if [ "$1" = "$SELF" ]; then bash -c "$cmd" <<<"$RT_PY_TREEHASH"; else ssh -o BatchMode=yes "$1" "$cmd" <<<"$RT_PY_TREEHASH" 2>/dev/null; fi
 }
 install_to() { # 호스트
   local tarcmd="set -e; d=$DEST; rm -rf \"\$d.new\"; mkdir -p \"\$d.new\"; tar -C \"\$d.new\" -xf - --no-same-owner; chmod -R go-w \"\$d.new\"; rm -rf \"\$d.old\"; [ -d \"\$d\" ] && mv \"\$d\" \"\$d.old\"; mv \"\$d.new\" \"\$d\"; rm -rf \"\$d.old\""

@@ -1,5 +1,27 @@
 # deploy/*.sh 공용 함수. source로 읽는다. HERE(저장소 루트)와 RT(원점 상태 dir)가 정해져 있어야 한다.
 
+# 해시는 python3로 낸다(맥 원점에는 GNU sha256sum이 없을 수 있다).
+rt_sha256() {
+  python3 -c 'import hashlib,sys
+h=hashlib.sha256()
+with open(sys.argv[1],"rb") as f:
+    for c in iter(lambda: f.read(1<<20), b""): h.update(c)
+print(h.hexdigest())' "$1"
+}
+
+# 폴더 판: 파일(이름 접미사로 거를 수 있다)별 sha256과 상대 경로를 경로순으로 모아 다시 sha256. 사용: rt_tree_hash <dir> [접미사]
+RT_PY_TREEHASH='import hashlib,os,sys
+root, suf = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
+rows = []
+for d, _, fs in os.walk(root):
+    for f in fs:
+        if f.endswith(suf):
+            p = os.path.join(d, f)
+            with open(p, "rb") as fh:
+                rows.append(("./" + os.path.relpath(p, root), hashlib.sha256(fh.read()).hexdigest()))
+print(hashlib.sha256("".join(f"{h}  {r}\n" for r, h in sorted(rows)).encode()).hexdigest())'
+rt_tree_hash() { python3 -c "$RT_PY_TREEHASH" "$@"; }
+
 # 원점 설정(config.yml)의 값 하나를 읽는다. 사용: rt_cfg 'c.gjcBinary'
 rt_cfg() {
   bun -e "const {loadConfig}=await import('$HERE/extension/core/config.ts');const c=loadConfig('$RT/config.yml');console.log(String($1 ?? ''))"

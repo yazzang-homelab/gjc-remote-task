@@ -53,10 +53,22 @@ Use it for heavy build and test work that would otherwise load the machine you a
 
 ## Requirements
 
-- **Origin:** `gjc` ≥ 0.22 with Bun, `git`, `ssh`, and Python 3.10+.
-- **Worker:** Linux with systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (for the regex rule), `git`, and Python 3.10+. The same CPU architecture as the origin, because the origin uploads its own `gjc` binary and the worker checks it against a pinned SHA-256. Developed on Debian 13.
+- **Origin:** `gjc` ≥ 0.22 with Bun, `git`, `ssh`, and Python 3.10+. Developed and tested on Linux. A macOS origin should work for SSH workers but is untested. Boxes need a Linux origin, because the box pump runs as a sandboxed systemd unit.
+- **Worker:** Linux with systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (for the regex rule), `git`, and Python 3.10+. x86_64 or aarch64. The worker never downloads `gjc` itself. The origin uploads a binary for the worker's platform, and the worker checks it against a pinned SHA-256. Developed on Debian 13. See [Different CPU architectures](#different-cpu-architectures).
 - **Model hub:** an OpenAI-compatible model endpoint, and a dedicated API key for the workers that allows only the models you list.
-- **Box (optional):** an x86_64 Linux VM with systemd, passwordless `sudo` for the login account, `python3`, `git`, `curl` and `tar`. The `ssh` driver needs only `ssh` on the origin and the VM's host key in `~/.ssh/known_hosts`. The `instabox` driver needs the `instabox` CLI and an `instabox-q` queue helper, which is not part of this repository. See [worker/box/drivers/README.md](worker/box/drivers/README.md).
+- **Box (optional):** an x86_64 or aarch64 Linux VM with systemd, passwordless `sudo` for the login account, `python3`, `git`, `curl` and `tar`. The `ssh` driver needs only `ssh` on the origin and the VM's host key in `~/.ssh/known_hosts`. The `instabox` driver needs the `instabox` CLI and an `instabox-q` queue helper, which is not part of this repository. See [worker/box/drivers/README.md](worker/box/drivers/README.md).
+
+## Different CPU architectures
+
+The origin and a worker may use different CPU architectures, for example an x86_64 origin with an aarch64 server, or an Apple Silicon origin with x86_64 servers. For each worker or box platform, the origin chooses the `gjc` binary in this order:
+
+1. The file set in `gjcBinaries` in `config.yml`, for example `gjcBinaries: { linux-arm64: ~/bin/gjc-arm64 }`.
+2. The origin's own `gjcBinary`, if the platform matches.
+3. The official release binary of the same version from `Yeachan-Heo/gajae-code`. The origin downloads it over HTTPS, checks it against the release's `gajae-release-binaries.sha256`, and caches it under `~/.gjc/agent/remote-task/gjc/<version>/`. It does this only if the origin's own binary matches the official hash for its own platform. A custom build fails with `gjc_custom_build`; set `gjcBinaries` instead.
+
+Workers record trusted binaries per platform in `trusted-gjc.sha256` (`<version> <platform> <sha256>`). Workers provisioned with an older version of this repository use a different format, so run `stage-worker.sh` again on them. Boxes download `gjc-<platform>` from the release themselves and check it against the per-platform hashes the origin passes in.
+
+Tested: the release lookup and hash check, and running the downloaded `gjc-linux-arm64` on an aarch64 host. A full job on an aarch64 worker has not been run.
 
 ## Setup
 

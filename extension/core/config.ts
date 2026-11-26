@@ -34,7 +34,10 @@ export interface RtConfig {
 	/** 박스 pump가 모델 요청을 보낼 허브와 키 파일(root 0600, 값은 argv·로그에 넣지 않는다). */
 	box: { hubBase: string; keyFile: string };
 	gjcVersion: string;
+	/** 원점과 같은 플랫폼의 대상에 올릴 gjc(보통 원점 자신의 gjc). */
 	gjcBinary: string;
+	/** 플랫폼별 gjc 파일(예: {"linux-arm64": "~/bin/gjc-arm64"}). 없으면 공식 릴리스에서 받는다(core/gjcbin.ts). */
+	gjcBinaries: Record<string, string>;
 	defaultModel: string;
 	rtKey: { allowedModels: string[] };
 	thresholds: { recommendLoad: number; recommendMemFree: number };
@@ -53,6 +56,7 @@ const DEFAULTS: RtConfig = {
 	box: { hubBase: "", keyFile: "" },
 	gjcVersion: "",
 	gjcBinary: join(homedir(), ".local", "bin", "gjc"),
+	gjcBinaries: {},
 	defaultModel: "",
 	rtKey: { allowedModels: [] },
 	thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },
@@ -78,7 +82,9 @@ export function loadConfig(path = join(rtHome(), "config.yml")): RtConfig {
 		thresholds: { ...DEFAULTS.thresholds, ...(raw.thresholds ?? {}) },
 		box: { ...DEFAULTS.box, ...(raw.box ?? {}) },
 	};
-	if (out.gjcBinary.startsWith("~/")) out.gjcBinary = join(homedir(), out.gjcBinary.slice(2));
+	const home = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+	out.gjcBinary = home(out.gjcBinary);
+	out.gjcBinaries = Object.fromEntries(Object.entries(raw.gjcBinaries ?? {}).map(([k, v]) => [k, home(String(v))]));
 	if (!out.gjcVersion) out.gjcVersion = gjcVersionOf(out.gjcBinary);
 	return out;
 }

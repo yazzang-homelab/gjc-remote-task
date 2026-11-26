@@ -1,6 +1,6 @@
 // 규칙 엔진(순수 함수). 후보·권장·탈락 사유를 계산한다. 최종 선택은 메인 LLM이 한다(§5.6).
-import { readFileSync } from "node:fs";
-import { cpus } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { normalizeModel, type RtConfig } from "./config";
 
 export interface LocalSnapshot {
@@ -10,16 +10,20 @@ export interface LocalSnapshot {
 }
 
 export function localSnapshot(): LocalSnapshot {
-	const load1 = Number(readFileSync("/proc/loadavg", "utf8").split(" ")[0]);
-	const mem: Record<string, number> = {};
-	for (const line of readFileSync("/proc/meminfo", "utf8").split("\n")) {
-		const m = /^(\w+):\s+(\d+)/.exec(line);
-		if (m) mem[m[1]!] = Number(m[2]);
+	// 리눅스는 MemAvailable(캐시 중 되찾을 수 있는 몫 포함)을 쓴다. 다른 OS(맥)는 os.freemem으로 대신한다.
+	let memAvailRatio = freemem() / Math.max(1, totalmem());
+	if (existsSync("/proc/meminfo")) {
+		const mem: Record<string, number> = {};
+		for (const line of readFileSync("/proc/meminfo", "utf8").split("\n")) {
+			const m = /^(\w+):\s+(\d+)/.exec(line);
+			if (m) mem[m[1]!] = Number(m[2]);
+		}
+		if (mem.MemAvailable && mem.MemTotal) memAvailRatio = mem.MemAvailable / mem.MemTotal;
 	}
 	return {
-		load1,
+		load1: loadavg()[0] ?? 0,
 		ncpu: cpus().length || 1,
-		memAvailRatio: Math.round(((mem.MemAvailable ?? 0) / Math.max(1, mem.MemTotal ?? 1)) * 1000) / 1000,
+		memAvailRatio: Math.round(memAvailRatio * 1000) / 1000,
 	};
 }
 
@@ -32,6 +36,8 @@ export interface TargetProbe {
 	load_max?: number;
 	credential?: boolean;
 	trusted_gjc?: string[];
+	/** 작업 호스트 플랫폼(linux-x64·linux-arm64). 원점이 그에 맞는 gjc를 올린다. */
+	platform?: string;
 	model_rejection?: string | null;
 	/** 대상이 지금 reserve를 받으면 낼 거절 사유(부하·PSI·디스크·경합 slice). */
 	admission?: string[];
@@ -88,6 +94,9 @@ export function evaluate(input: RuleInput): RuleOutput {
 			if (s && t.kind === "ssh" && s.load_ratio >= Math.min(t.loadMax, p.load_max ?? t.loadMax)) reasons.push("remote_overloaded");
 			if (p.credential === false) reasons.push("credential_missing");
 			if (p.trusted_gjc && !p.trusted_gjc.includes(config.gjcVersion)) reasons.push("gjc_version_untrusted");
+			// 플랫폼을 알리지 않는 rt-helper는 이 판 이전에 준비한 작업 호스트다(trusted-gjc 형식도 다르다). stage-worker.sh를 다시 돌린다.
+			if (t.kind === "ssh" && p.platform === undefined) reasons.push("worker_outdated");
+			else if (p.platform !== undefined && !/^linux-(x64|arm64)$/.test(p.platform)) reasons.push("gjc_platform_unsupported");
 			if (p.model_rejection) reasons.push(p.model_rejection);
 			for (const r of p.admission ?? []) reasons.push(r);
 			if (s && s.disk_free_gb < 5) reasons.push("disk_low");

@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { loadConfig, rtHome, type RtConfig } from "./core/config";
 import { makeCursor, parseCursor } from "./core/cursor";
-import { git, GitError, makeBaseBundle, repoFacts, sha256File, verifyAndImport } from "./core/gitops";
+import { git, GitError, makeBaseBundle, repoFacts, verifyAndImport } from "./core/gitops";
+import { GjcResolveError, resolveGjc } from "./core/gjcbin";
 import { evaluate, localSnapshot, type TargetProbe } from "./core/rules";
 import { assertTransition, type JobState, newJobId, newMsgId, phaseOf } from "./core/state";
 import { type EventRow, type JobRow, Store } from "./core/store";
@@ -256,7 +257,7 @@ export class RemoteTasks {
 			updated_at: now,
 		};
 		if (!this.store.reserveLocal(row, tcfg.maxSlots)) throw new ToolFailure("target_rejected", { target, reasons: ["slots_full"] });
-		let reserve: { cap: string; gjc_installed: boolean };
+		let reserve: { cap: string; gjc_installed: boolean; platform?: string };
 		try {
 			reserve = await this.transport(target).call("reserve", [jobId, 1, row.est_min, ctx.session, this.config.gjcVersion, model], {
 				auth: this.regAuth(target),
@@ -278,7 +279,7 @@ export class RemoteTasks {
 		const taskMd = renderTask(input);
 		writeFileSync(join(this.jobDir(jobId), "task.md"), taskMd, { mode: 0o600 });
 		if (box) writeFileSync(join(this.jobDir(jobId), "box.json"), JSON.stringify(box), { mode: 0o600 });
-		const bg = this.stageAndLaunch(jobId, taskMd, input, reserve.gjc_installed, pre).catch(() => {});
+		const bg = this.stageAndLaunch(jobId, taskMd, input, reserve.gjc_installed, reserve.platform ?? "", pre).catch(() => {});
 		this.background.set(jobId, bg);
 		bg.finally(() => this.background.delete(jobId));
 		return {
@@ -295,7 +296,7 @@ export class RemoteTasks {
 
 	/** reserve 뒤 단계: 기준 bundle 업로드 → prepare → (필요시 gjc 설치) → launch. */
 	/** pre: start 앞 단계(저장소 사실·박스 사전검사·probe·reserve) 소요 ms. timing-start.json에 함께 남긴다. */
-	private async stageAndLaunch(jobId: string, taskMd: string, input: StartInput, gjcInstalled: boolean, pre: Record<string, number>): Promise<void> {
+	private async stageAndLaunch(jobId: string, taskMd: string, input: StartInput, gjcInstalled: boolean, platform: string, pre: Record<string, number>): Promise<void> {
 		const job = this.store.job(jobId)!;
 		const tr = this.transport(job.target);
 		const auth = this.capAuth(job);
@@ -314,10 +315,11 @@ export class RemoteTasks {
 		};
 		try {
 			if (!gjcInstalled) {
-				const sha = sha256File(this.config.gjcBinary);
-				await tr.call("install-gjc", [this.config.gjcVersion, sha], {
+				// 작업 호스트의 플랫폼(reserve가 알려 준다)에 맞는 gjc를 고른다. 원점과 다르면 공식 릴리스에서 받는다.
+				const bin = await resolveGjc(this.config, platform, this.home);
+				await tr.call("install-gjc", [this.config.gjcVersion, bin.sha], {
 					auth: this.regAuth(job.target),
-					bodyFile: this.config.gjcBinary,
+					bodyFile: bin.path,
 					timeoutMs: 15 * 60_000,
 				});
 			}
@@ -350,7 +352,7 @@ export class RemoteTasks {
 			lap("prepare");
 			this.setState(job, "staged");
 		} catch (e) {
-			const code = e instanceof RemoteError || e instanceof GitError || e instanceof ToolFailure ? e.code : "stage_failed";
+			const code = e instanceof RemoteError || e instanceof GitError || e instanceof ToolFailure || e instanceof GjcResolveError ? e.code : "stage_failed";
 			// 시작 전 실패는 원격 슬롯도 바로 반납한다(cancel이 봉인 + 반납).
 			await tr.call("cancel", [jobId, job.gen], { auth, timeoutMs: 60_000 }).catch(() => {});
 			// 실행 전이라 회수할 커밋이 없다. 올린 기준 bundle·작업 디렉터리를 바로 지운다.

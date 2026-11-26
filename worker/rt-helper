@@ -293,12 +293,20 @@ def installed_gjc() -> list[str]:
         return []
 
 
+def host_platform() -> str:
+    """릴리스 자산 이름의 플랫폼(linux-x64, linux-arm64). 원점이 이 값으로 올릴 gjc를 고른다."""
+    m = os.uname().machine.lower()
+    return "linux-" + {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m)
+
+
 def trusted_gjc() -> dict:
+    """신뢰표 "<판> <플랫폼> <sha256>" 가운데 이 호스트 플랫폼 줄만 {판: sha}로 읽는다."""
     table = {}
+    plat = host_platform()
     for line in read_root_file(os.path.join(ETC, "trusted-gjc.sha256")).splitlines():
         parts = line.split()
-        if len(parts) == 2 and RX["version"].match(parts[0]) and RX["sha256"].match(parts[1]):
-            table[parts[0]] = parts[1]
+        if len(parts) == 3 and RX["version"].match(parts[0]) and parts[1] == plat and RX["sha256"].match(parts[2]):
+            table[parts[0]] = parts[2]
     return table
 
 
@@ -424,7 +432,7 @@ def reclaim(slots: list[dict]) -> list[dict]:
 def v_hello(origin: str, args: list[str]) -> None:
     cfg = load_config()
     emit({"ok": True, "proto": PROTO, "bundle_version": cfg["bundle_version"], "gjc": installed_gjc(),
-          "ncpu": os.cpu_count(), "host": os.uname().nodename, "origin": origin})
+          "platform": host_platform(), "ncpu": os.cpu_count(), "host": os.uname().nodename, "origin": origin})
 
 
 def v_probe(origin: str, args: list[str]) -> None:
@@ -448,6 +456,7 @@ def v_probe(origin: str, args: list[str]) -> None:
     snap = load_snapshot()
     res = {"ok": True, "snapshot": snap, "slots_used": len(live), "slots_max": cfg["max_slots"],
            "load_max": cfg["load_max"], "gjc": installed_gjc(), "trusted_gjc": sorted(trusted_gjc()),
+           "platform": host_platform(),
            "credential": os.path.exists(KEY_FILE), "bundle_version": cfg["bundle_version"],
            "admission": admission(cfg)}
     if model:
@@ -493,7 +502,7 @@ def v_reserve(origin: str, args: list[str]) -> None:
         if meta["origin"] != origin or meta["main_session"] != session or meta["gen"] != gen:
             raise HelperError("job_conflict", status=3)
         emit({"ok": True, "duplicate": True, "cap": cap_token(origin, session, job, gen),
-              "gjc_installed": gjc_binary_ok(ver), "state": meta.get("state")})
+              "gjc_installed": gjc_binary_ok(ver), "platform": host_platform(), "state": meta.get("state")})
         return
     rej = model_check(cfg, model)
     if rej:
@@ -519,7 +528,7 @@ def v_reserve(origin: str, args: list[str]) -> None:
                       "main_session": session, "origin": origin, "invocation": None, "boot_id": None})
         slots_save(slots)
     emit({"ok": True, "duplicate": False, "cap": cap_token(origin, session, job, gen),
-          "gjc_installed": gjc_binary_ok(ver), "lease_s": cfg["lease_s"]})
+          "gjc_installed": gjc_binary_ok(ver), "platform": host_platform(), "lease_s": cfg["lease_s"]})
 
 
 def extend_lease(job: str, gen: int, state: str | None = None) -> None:

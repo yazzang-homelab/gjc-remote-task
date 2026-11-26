@@ -20,7 +20,7 @@ targets:
   # VM과 말하는 방법은 driver가 정한다(worker/box/drivers/README.md).
   #
   # driver: ssh — SSH로 닿는 아무 클라우드 VM(EC2·GCE·Hetzner·DigitalOcean 등).
-  #   VM: x86_64 systemd 리눅스, 접속 계정의 비밀번호 없는 sudo, python3·git·curl·tar.
+  #   VM: x86_64·aarch64 systemd 리눅스, 접속 계정의 비밀번호 없는 sudo, python3·git·curl·tar.
   #   원점의 ~/.ssh/known_hosts에 VM 호스트 키를 미리 넣어 둔다(pump는 BatchMode로 접속한다).
   # pub1:
   #   kind: box
@@ -43,9 +43,13 @@ box:
   hubBase: https://hub.example.com/v1
   keyFile: /root/.gjc/agent/remote-task/keys/gjc-rt.key
 
-# 작업 호스트로 올릴 gjc 실행 파일(작업 호스트와 같은 아키텍처). gjcVersion을 비우면 `gjc --version`으로 읽는다.
+# 원점의 gjc 실행 파일. 플랫폼이 같은 작업 호스트에 그대로 올린다. gjcVersion을 비우면 `gjc --version`으로 읽는다.
 gjcBinary: ~/.local/bin/gjc
 # gjcVersion: 0.22.0
+# 플랫폼이 다른 작업 호스트용 gjc(선택). 비우면 같은 판의 공식 릴리스를 받아 해시를 확인해 쓴다
+# (원점 gjc가 공식 빌드일 때만). 플랫폼 이름: linux-x64 · linux-arm64
+# gjcBinaries:
+#   linux-arm64: ~/bin/gjc-linux-arm64
 
 # remote_task start에서 model을 생략했을 때 쓰는 모델. 아래 허용 목록 안에 있어야 한다.
 defaultModel: my-hub/my-model:high

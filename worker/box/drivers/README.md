@@ -17,7 +17,7 @@ targets:
 
 ## VM requirements (all drivers)
 
-- x86_64 Linux with systemd (the box downloads the `gjc-linux-x64` release).
+- x86_64 or aarch64 Linux with systemd. The box downloads the `gjc-linux-x64` or `gjc-linux-arm64` release for its own platform and checks it against the hash the origin passes in.
 - The login account has passwordless `sudo`. `rt-boxctl` uses it to create the root-owned control area `/data/rt-ctl`, the unprivileged runner account `rtrun`, and the per-job systemd scope.
 - `python3`, `git`, `curl`, `tar`, `setpriv` (util-linux).
 - Outbound HTTPS to github.com. The box never connects to the origin; the origin reaches the box's relay through the driver's `forward`.
