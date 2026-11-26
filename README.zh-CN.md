@@ -152,4 +152,4 @@ for t in test/py/test_*.py; do python3 "$t"; done   # 工作主机端测试
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。`worker/bundle/role.md` 改编自 Gajae Code 的 executor 提示词（MIT，© Yeachan-Heo and Gajae Code Contributors）。
+MIT，见 [LICENSE](LICENSE), [NOTICE](NOTICE)。`worker/bundle/role.md` 改编自 Gajae Code 的 executor 提示词（MIT，© Yeachan-Heo and Gajae Code Contributors）。

@@ -152,4 +152,4 @@ for t in test/py/test_*.py; do python3 "$t"; done   # pruebas del lado del host 
 
 ## Licencia
 
-MIT. Consulta [LICENSE](LICENSE). `worker/bundle/role.md` está adaptado del prompt de executor de Gajae Code (MIT, © Yeachan-Heo and Gajae Code Contributors).
+MIT. Consulta [LICENSE](LICENSE), [NOTICE](NOTICE). `worker/bundle/role.md` está adaptado del prompt de executor de Gajae Code (MIT, © Yeachan-Heo and Gajae Code Contributors).

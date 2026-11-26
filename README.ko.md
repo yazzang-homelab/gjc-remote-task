@@ -152,4 +152,4 @@ for t in test/py/test_*.py; do python3 "$t"; done   # 작업 호스트 쪽 시�
 
 ## 라이선스
 
-MIT. [LICENSE](LICENSE)를 보세요. `worker/bundle/role.md`는 Gajae Code의 executor 프롬프트(MIT, © Yeachan-Heo and Gajae Code Contributors)를 고쳐 쓴 것입니다.
+MIT. [LICENSE](LICENSE), [NOTICE](NOTICE)를 보세요. `worker/bundle/role.md`는 Gajae Code의 executor 프롬프트(MIT, © Yeachan-Heo and Gajae Code Contributors)를 고쳐 쓴 것입니다.

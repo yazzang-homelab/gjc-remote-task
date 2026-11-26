@@ -152,4 +152,4 @@ for t in test/py/test_*.py; do python3 "$t"; done   # worker-side tests
 
 ## License
 
-MIT. See [LICENSE](LICENSE). `worker/bundle/role.md` is adapted from the executor prompt of Gajae Code (MIT, © Yeachan-Heo and Gajae Code Contributors).
+MIT. See [LICENSE](LICENSE), [NOTICE](NOTICE). `worker/bundle/role.md` is adapted from the executor prompt of Gajae Code (MIT, © Yeachan-Heo and Gajae Code Contributors).
