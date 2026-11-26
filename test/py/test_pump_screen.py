@@ -19,7 +19,8 @@ def load_pump():
     with open(os.path.join(d, "key"), "wb") as f:
         f.write(KEY + b"\n")
     with open(os.path.join(d, "pump.json"), "w") as f:
-        json.dump({"job": "j", "gen": 1, "alias": "a", "machine": "m", "lport": 1, "key_file": os.path.join(d, "key")}, f)
+        json.dump({"job": "j", "gen": 1, "driver": "/nonexistent/rt-box-ssh", "target": {"kind": "box", "driver": "ssh", "host": "h"},
+                   "lport": 1, "key_file": os.path.join(d, "key")}, f)
     # 지문 파일은 pump와 같은 폴더에서 읽는다 → 시험용 사본 폴더를 만든다.
     w = tempfile.mkdtemp()
     for src, name in ((PUMP, "rt-boxpump.py"), (os.path.join(BUNDLE, "rtlib.py"), "rtlib.py")):
@@ -143,7 +144,7 @@ class ScreenIncremental(unittest.TestCase):
 
 
 class WaitStart(unittest.TestCase):
-    """대기줄 감시(instabox-q wait)는 러너 ended를 받은 뒤에야 시작한다(그 전에는 CPU를 쓰지 않는다)."""
+    """대기줄 감시(드라이버 wait)는 러너 ended를 받은 뒤에야 시작한다(그 전에는 CPU를 쓰지 않는다)."""
     def test_ended_event_starts_wait(self):
         p = load_pump()
         p.append_events([{"seq": 1, "ts": "t", "kind": "started", "data": {}}, {"seq": 2, "ts": "t", "kind": "final", "data": {}}])
@@ -213,10 +214,17 @@ class WaitStart(unittest.TestCase):
         p = load_pump()
         import subprocess
         p.CFG["qid"] = "20261126T000000-x"
-        p.q = lambda *a, **k: subprocess.CompletedProcess(a, 0, b"id=x\nstate=failed\nexit_code=3\n", b"")
+        p.q = lambda *a, **k: subprocess.CompletedProcess(a, 0, b'{"state": "failed", "exit": "3"}\n', b"")
         self.assertEqual(p.queue_state(), ("failed", "3"))
+        p.q = lambda *a, **k: subprocess.CompletedProcess(a, 0, b'{"state": "unknown", "exit": null}\n', b"")
+        self.assertEqual(p.queue_state(), (None, None))
         p.q = lambda *a, **k: subprocess.CompletedProcess(a, 1, b"", b"no such job")
         self.assertEqual(p.queue_state(), (None, None))
+
+    def test_driver_gets_target_env(self):
+        p = load_pump()
+        self.assertEqual(json.loads(p.DENV["RT_BOX_TARGET"])["host"], "h")
+        self.assertTrue(p.DRIVER.endswith("rt-box-ssh"))
 
 
 if __name__ == "__main__":

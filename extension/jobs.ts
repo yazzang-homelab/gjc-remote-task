@@ -107,7 +107,7 @@ export class RemoteTasks {
 	}
 
 	private regAuth(target: string): string {
-		// 박스는 원점의 원장과 instabox-q 계정 키로 움직인다. 호스트 등록 토큰이 없다.
+		// 박스는 원점의 원장과 박스 드라이버의 접속 수단으로 움직인다. 호스트 등록 토큰이 없다.
 		if (this.isBox(target)) return "";
 		const p = join(this.home, "hosts", `${target}.token`);
 		if (!existsSync(p)) throw new ToolFailure("credential_missing", { target, detail: "host token" });

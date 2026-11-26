@@ -4,7 +4,7 @@
 계약(계획 §19.2·§20~§24):
 - /data/rt-ctl/            root 0700. 이 도구, 잡별 표식·잠금. 러너(rtrun)는 읽지도 쓰지도 못한다.
 - /data/rt-pub/            root 0755. 러너가 읽고 실행하는 묶음(bundle/<판>/)과 gjc(gjc/<판>/gjc).
-- /data/workspace/rt/<job>/ root 0755. work/(rtrun 0700, 러너 작업 영역), out/(root 0755, instabox-q fetch용).
+- /data/workspace/rt/<job>/ root 0755. work/(rtrun 0700, 러너 작업 영역), out/(root 0755, 드라이버 fetch용).
 - 러너는 전용 계정 rtrun(sudo·보조 그룹·linger 없음, nologin)으로 setpriv --no-new-privs 아래에서 돈다.
 - 신뢰하지 않는 데이터(work/ 아래)는 root가 직접 열지 않는다. 권한을 내린 자식이 읽어 파이프로 넘긴다(§17.1).
 - 시작: ctl 유닛(rt-<j>-g<gen>-ctl.service) 안의 start-inner가 잠금 안에서 봉인 없음 확인 → starting 표식
@@ -195,7 +195,7 @@ def ensure_dirs() -> None:
         if st.st_uid != 0:
             os.chown(path, 0, 0)
         os.chmod(path, mode)
-    # instabox-q gc는 .keep 없는 /data/workspace/* 를 2일 뒤 지운다. 정리는 이 도구의 gc(7일)가 한다.
+    # 박스 쪽 정리 도구(예: instabox-q gc는 .keep 없는 /data/workspace/*를 2일 뒤 지운다)가 지우지 않게 둔다. 정리는 이 도구의 gc(7일)가 한다.
     keep = os.path.join(WS, ".keep")
     if not os.path.exists(keep):
         write_root(keep, b"gjc-rt\n", 0o644)

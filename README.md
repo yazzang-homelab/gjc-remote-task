@@ -10,7 +10,7 @@ Use it for heavy build and test work that would otherwise load the machine you a
 
 - **Two kinds of targets**
   - *Trusted SSH worker hosts* that you provision.
-  - Optional *public-work boxes*: disposable [instabox.sh](https://instabox.sh) microVMs, treated as untrusted. They run only public repositories and never receive credentials.
+  - Optional *public-work boxes*: disposable cloud VMs, treated as untrusted. They run only public repositories and never receive credentials. A small driver talks to the VM: `ssh` works with any VM you can reach over SSH (EC2, GCE, Hetzner, DigitalOcean, ...), and `instabox` works with [instabox.sh](https://instabox.sh) microVMs.
 - **A full job lifecycle in one tool**
   - `plan` shows local load, the candidate targets, and why any were rejected. You pick the target.
   - `start` sends a git bundle of a committed `HEAD` (or `base_ref`). The remote executor works on branch `rt/<job>`.
@@ -31,7 +31,7 @@ Use it for heavy build and test work that would otherwise load the machine you a
  │     ├ state.db (jobs)    │ ◀────────────────── │   └ systemd unit per job (gjcrt) │
  │     └ watcher (wake-up)  │   events / bundle   │       rt-runner → gjc executor   │
  └──────────────────────────┘                     └──────────────────────────────────┘
-          │  instabox-q queue + port-forward (pull only)
+          │  box driver: upload, submit, port-forward (pull only)
           ▼
  public box (untrusted): relay ⇄ pump on origin ⇄ model hub (key stays on origin)
 ```
@@ -48,7 +48,7 @@ Use it for heavy build and test work that would otherwise load the machine you a
   - The dedicated model-hub key on the worker is fingerprinted the same way.
 - **Box mode**
   - Before dispatch, the origin checks that the repository's GitHub origin is public (anonymous API) and that the base commit is public. It then scans the unpushed commits and the task text for token patterns and fingerprints.
-  - The box cannot connect back. A pump on the origin pulls model requests from the box's relay over `instabox port-forward` and forwards them to the hub with the key, which never leaves the origin.
+  - The box cannot connect back. A pump on the origin pulls model requests from the box's relay through the driver's port forward and forwards them to the hub with the key, which never leaves the origin.
   - Boxes refuse `needs: [docker|sudo]` and jobs that would outlive the box's remaining runtime.
 
 ## Requirements
@@ -56,7 +56,7 @@ Use it for heavy build and test work that would otherwise load the machine you a
 - **Origin:** `gjc` ≥ 0.22 with Bun, `git`, `ssh`, and Python 3.10+.
 - **Worker:** Linux with systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (for the regex rule), `git`, and Python 3.10+. The same CPU architecture as the origin, because the origin uploads its own `gjc` binary and the worker checks it against a pinned SHA-256. Developed on Debian 13.
 - **Model hub:** an OpenAI-compatible model endpoint, and a dedicated API key for the workers that allows only the models you list.
-- **Box transport (optional):** the `instabox` CLI and an `instabox-q` queue helper. `instabox-q` is not part of this repository. Without it, configure SSH targets only.
+- **Box (optional):** an x86_64 Linux VM with systemd, passwordless `sudo` for the login account, `python3`, `git`, `curl` and `tar`. The `ssh` driver needs only `ssh` on the origin and the VM's host key in `~/.ssh/known_hosts`. The `instabox` driver needs the `instabox` CLI and an `instabox-q` queue helper, which is not part of this repository. See [worker/box/drivers/README.md](worker/box/drivers/README.md).
 
 ## Setup
 
@@ -103,7 +103,7 @@ Roll back a worker with `deploy/rollback-worker.sh`, run as root on the worker. 
 
 ### 3. Boxes (optional)
 
-Add a `kind: box` target and the `box:` section to `config.yml`, then run `bash deploy/stage-box.sh`. Configure boxes on one origin only, because the box pool ledger lives in that origin's local state.
+Add a `kind: box` target with a `driver` (`ssh` by default) and the `box:` section to `config.yml`, then run `bash deploy/stage-box.sh`. To support another provider, write a driver that implements the verbs in [worker/box/drivers/README.md](worker/box/drivers/README.md). Configure boxes on one origin only, because the box pool ledger lives in that origin's local state.
 
 ## Usage
 
@@ -123,7 +123,7 @@ The tool is available in the **main** session only. Typical calls:
 
 ## Measured results
 
-These come from one homelab setup: an Intel Xeon E-2124G origin, two worker hosts, and one 4 vCPU box. Every job used a real model through a real hub. Each configuration ran at least 5 paired rounds, comparing a local run (L) with the remote run (R). The table shows medians.
+These come from one homelab setup: an Intel Xeon E-2124G origin, two worker hosts, and one 4 vCPU instabox.sh box (`instabox` driver). Every job used a real model through a real hub. Each configuration ran at least 5 paired rounds, comparing a local run (L) with the remote run (R). The table shows medians.
 
 | Target | Local CPU used by a remote job (R ÷ L) | Wall time (R ÷ L) |
 |---|---|---|
@@ -137,7 +137,7 @@ The SSH wall ratio leaves out the time the remote runner spends re-running `chec
 - Code comments, the tool description and the remote role prompt (`worker/bundle/role.md`) are in Korean, and the remote executor is told to report in Korean. Edit `role.md` to change this.
 - Only `executor`-style work is supported. The remote side does not delegate to other agents.
 - SSH workers need root provisioning, systemd and sudo. Containers without systemd are not supported.
-- The box transport depends on instabox.sh and the unpublished `instabox-q` helper.
+- The measured box numbers above use the `instabox` driver. The `ssh` driver was checked end to end on a real cloud VM (a question and answer job, and a cancelled job, both collected) with a mock model hub, but it has no performance measurements.
 
 ## Development
 

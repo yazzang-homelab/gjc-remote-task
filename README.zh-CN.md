@@ -10,7 +10,7 @@
 
 - **两类目标**
   - *受信任的 SSH 工作主机*：由你自行部署。
-  - *公开任务用的 box（可选）*：一次性的 [instabox.sh](https://instabox.sh) microVM，视为不受信任。只运行公开仓库，绝不接收任何凭据。
+  - *公开任务用的 box（可选）*：一次性的云虚拟机，视为不受信任。只运行公开仓库，绝不接收任何凭据。与虚拟机的通信由一个小驱动负责：`ssh` 驱动适用于任何可以通过 SSH 访问的虚拟机（EC2、GCE、Hetzner、DigitalOcean 等），`instabox` 驱动适用于 [instabox.sh](https://instabox.sh) microVM。
 - **一个工具覆盖任务的完整生命周期**
   - `plan`：显示本地负载、候选目标以及被排除的原因。目标由调用方选择。
   - `start`：把已提交的 `HEAD`（或 `base_ref`）打包成 git bundle 发送出去。远程 executor 在 `rt/<job>` 分支上工作。
@@ -31,7 +31,7 @@
  │     ├ state.db（任务）   │ ◀────────────────── │   └ 每个任务一个 systemd 单元    │
  │     └ 监视器（唤醒）     │   事件 / bundle     │       rt-runner → gjc executor   │
  └──────────────────────────┘                     └──────────────────────────────────┘
-          │  instabox-q 队列 + port-forward（只拉取）
+          │  box 驱动：上传、提交、port-forward（只拉取）
           ▼
  公开 box（不受信任）：relay ⇄ origin 上的 pump ⇄ 模型 hub（密钥只留在 origin）
 ```
@@ -48,7 +48,7 @@
   - 工作主机上专用的模型 hub 密钥也以同样方式记录指纹。
 - **box 模式**
   - 发送前，origin 会检查仓库的 GitHub origin 是否公开（匿名 API），以及基准提交是否存在于公开仓库中；随后扫描尚未推送的提交和任务说明，查找令牌格式和指纹。
-  - box 无法反向连接。origin 上的 pump 通过 `instabox port-forward` 从 box 的 relay 拉取模型请求，并带上密钥转发给 hub；密钥从不离开 origin。
+  - box 无法反向连接。origin 上的 pump 通过驱动的端口转发从 box 的 relay 拉取模型请求，并带上密钥转发给 hub；密钥从不离开 origin。
   - box 拒绝 `needs: [docker|sudo]` 的任务，也拒绝会超出 box 剩余运行时长的任务。
 
 ## 环境要求
@@ -56,7 +56,7 @@
 - **origin**：`gjc` 0.22 或更高版本以及 Bun、`git`、`ssh`、Python 3.10+。
 - **工作主机**：带 systemd（cgroup v2）的 Linux、OpenSSH、`sudo` 1.9.10+（用于正则规则）、`git`、Python 3.10+。CPU 架构需与 origin 相同，因为 origin 会上传自己的 `gjc` 可执行文件，工作主机用固定的 SHA-256 校验它。开发环境为 Debian 13。
 - **模型 hub**：一个兼容 OpenAI 的模型端点，以及一个只允许指定模型的工作主机专用 API 密钥。
-- **box 传输（可选）**：`instabox` CLI 和 `instabox-q` 队列工具。`instabox-q` 不包含在本仓库中；没有它时，请只配置 SSH 目标。
+- **box（可选）**：带 systemd 的 x86_64 Linux 虚拟机，登录账号需要免密码 `sudo`，并装有 `python3`、`git`、`curl` 和 `tar`。`ssh` 驱动在 origin 上只需要 `ssh`，并需事先把虚拟机的主机密钥加入 `~/.ssh/known_hosts`。`instabox` 驱动需要 `instabox` CLI 和 `instabox-q` 队列工具，后者不包含在本仓库中。详见 [worker/box/drivers/README.md](worker/box/drivers/README.md)。
 
 ## 安装
 
@@ -103,7 +103,7 @@ bash deploy/sync.sh             # 把 extension/ 安装到 ~/.gjc/agent/extensio
 
 ### 3. box（可选）
 
-在 `config.yml` 中添加 `kind: box` 目标和 `box:` 配置段，然后运行 `bash deploy/stage-box.sh`。box 池的账本保存在该 origin 的本地状态中，因此 box 只应在一个 origin 上配置。
+在 `config.yml` 中添加带 `driver`（默认 `ssh`）的 `kind: box` 目标和 `box:` 配置段，然后运行 `bash deploy/stage-box.sh`。要支持其他服务商，请编写实现 [worker/box/drivers/README.md](worker/box/drivers/README.md) 中各动词的驱动。box 池的账本保存在该 origin 的本地状态中，因此 box 只应在一个 origin 上配置。
 
 ## 使用
 
@@ -123,7 +123,7 @@ bash deploy/sync.sh             # 把 extension/ 安装到 ~/.gjc/agent/extensio
 
 ## 实测结果
 
-以下数据来自一套家庭实验室环境：origin 为 Intel Xeon E-2124G，另有两台工作主机和一台 4 vCPU 的 box。所有任务都经过真实 hub 使用真实模型运行。每种组合把本地运行（L）与远程运行（R）配对，至少运行 5 轮，表中为中位数。
+以下数据来自一套家庭实验室环境：origin 为 Intel Xeon E-2124G，另有两台工作主机和一台 4 vCPU 的 instabox.sh box（`instabox` 驱动）。所有任务都经过真实 hub 使用真实模型运行。每种组合把本地运行（L）与远程运行（R）配对，至少运行 5 轮，表中为中位数。
 
 | 目标 | 远程任务占用的本地 CPU（R ÷ L） | 运行时间（R ÷ L） |
 |---|---|---|
@@ -137,7 +137,7 @@ SSH 的运行时间比不含远程运行器重新执行 `checks` 的时间，因
 - 代码注释、工具说明和远程角色提示词（`worker/bundle/role.md`）为韩语，远程 executor 也被要求用韩语报告。如需更改，请编辑 `role.md`。
 - 只支持 `executor` 类型的工作。远程端不会再委派给其他代理。
 - SSH 工作主机需要 root 部署、systemd 和 sudo。不支持没有 systemd 的容器。
-- box 传输依赖 instabox.sh 和未公开的 `instabox-q` 工具。
+- 上面的 box 数据来自 `instabox` 驱动。`ssh` 驱动已在真实云虚拟机上配合模拟模型 hub 做过端到端检查（一个问答任务和一个被取消的任务，均已取回），但没有性能测量。
 
 ## 开发
 

@@ -4,7 +4,7 @@ import { RemoteTasks, ToolFailure } from "./jobs";
 import { RemoteError } from "./transport/ssh";
 import { Watcher } from "./watcher";
 
-const DESCRIPTION = `원격 작업 호스트(SSH)나 공개 작업용 박스(instabox)에서 executor 작업을 분리 실행한다. 메인 세션 전용.
+const DESCRIPTION = `원격 작업 호스트(SSH)나 공개 작업용 박스(일회용 클라우드 VM)에서 executor 작업을 분리 실행한다. 메인 세션 전용.
 - 박스: github 공개 원본 저장소만 된다. 미push 커밋·지시문은 비밀 검사를 거친다. sudo·docker가 필요하면 needs에 적는다(박스는 거절).
 - 쓸 때: 빌드·시험처럼 로컬 CPU를 많이 쓰는 작업. 모델 대화만 하는 가벼운 작업은 로컬 task가 더 싸다(원격 조율에도 메인 CPU가 든다).
 - plan: 로컬 부하·대상별 후보·탈락 사유를 본다(쓰기 없음). 최종 대상은 네가 고른다.

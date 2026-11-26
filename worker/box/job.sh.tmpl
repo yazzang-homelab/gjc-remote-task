@@ -1,5 +1,5 @@
 #!/bin/bash
-# gjc-rt 박스 잡 @JOB@ g@GEN@. instabox-q 대기줄 작업으로 박스 user가 실행한다.
+# gjc-rt 박스 잡 @JOB@ g@GEN@. 박스 드라이버가 투입한 작업으로 박스 접속 계정이 실행한다.
 # 관리 단계만 sudo로 rt-boxctl(root)에 맡기고, 러너는 scope 안에서 rtrun으로 돈다(계획 §19.2·§20~§23).
 set -uo pipefail
 JOB=@JOB@
@@ -35,7 +35,7 @@ wait $!
 rc=$?
 log "ctl exit $rc"
 
-# 4. 결과를 root 소유 out/에 모은다(메인 호스트 pump가 instabox-q fetch로 가져간다). 7일 지난 잡 정리.
+# 4. 결과를 root 소유 out/에 모은다(원점 pump가 드라이버 fetch로 가져간다). 7일 지난 잡 정리.
 sudo -n "$BIN" collect-prep "$JOB" completed
 sudo -n "$BIN" gc > /dev/null
 exit $rc

@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 """gjc-rt 박스 pump. 원점(메인 호스트)에서 잡마다 systemd 유닛 gjc-rt-pump-<job>으로 돈다.
 
-박스는 우리에게 연결하지 못한다. pump가 instabox port-forward로 박스 relay(127.0.0.1:10101)에 들어가서
+박스는 우리에게 연결하지 못한다. pump가 박스 드라이버의 forward(원점 127.0.0.1:lport → 박스 127.0.0.1:10101)로
+박스 relay에 들어가서
 - 모델 요청을 꺼내 정책(경로 2개·그 잡의 모델 1개·JSON·16 MiB·요청 수·마감)을 본 뒤 허브에 키를 붙여 보내고
   응답을 chunked로 돌려준다. 박스는 모델 출력만 받는다.
 - 이벤트를 롱폴로 받아 로컬 spool의 events.jsonl에 쌓는다(seq 증가·크기 검사, 내용은 데이터로만 다룬다).
 - 확장이 outbox/에 둔 메시지를 박스 inbox로 넣고 결과를 outbox/<id>.res에 쓴다.
-- instabox-q wait으로 박스가 잠들지 않게 붙어 있다가 작업이 끝나면 out/을 instabox-q fetch로 가져오고
+- 드라이버 wait으로 작업 끝을 기다리다가(instabox는 이 동안 박스가 잠들지 않는다) out/을 드라이버 fetch로 가져오고
   rt-boxctl release-check 결과를 pump-state.json에 남긴다. 슬롯 반납은 확장이 이 증명을 보고 한다.
 
 사용: rt-boxpump.py <spool_dir>   (spool_dir/pump.json에 설정)
@@ -34,19 +35,22 @@ MAX_BODY = 16 << 20
 ID_RE = re.compile(r"[0-9a-f]{32}")
 MSG_RE = re.compile(r"msg-[0-9a-z]{6,40}")
 EVENT_LINE_MAX = 64 * 1024
-QENV = {**os.environ, "INSTABOX_NO_TELEMETRY": "1", "INSTABOX_NO_UPDATE_CHECK": "1"}
 
 SPOOL = sys.argv[1]
 with open(os.path.join(SPOOL, "pump.json"), encoding="utf-8") as _f:
     CFG = json.load(_f)
-JOB, GEN, ALIAS, MACHINE = CFG["job"], CFG["gen"], CFG["alias"], CFG["machine"]
+JOB, GEN = CFG["job"], CFG["gen"]
+# 박스 드라이버(worker/box/drivers/rt-box-<driver>)와 그 대상 설정. VM 종류의 차이는 드라이버가 맡는다.
+DRIVER = CFG.get("driver", "")
+DENV = {**os.environ, "RT_BOX_TARGET": json.dumps(CFG.get("target") or {})}
 LPORT = CFG["lport"]
 stop = threading.Event()
 job_done = threading.Event()
-# 대기줄 작업 감시(instabox-q wait: 10초마다 activity lease + 상태 조회)는 pump CPU의 절반쯤을 쓴다(AC-11 부하 기준).
+# 대기줄 작업 감시(드라이버 wait: instabox는 10초마다 activity lease + 상태 조회)는 pump CPU의 절반쯤을 쓴다.
 # 작업이 끝날 즈음에만 필요하므로 중계 끊김(러너는 gjc가 끝나면 relay를 먼저 닫는다 → 30초 뒤)·러너 ended(relay가 살아
 # 있을 때만 받는다)·취소 표식(wait-now)·relay가 없을 때 1분마다 엿본 대기줄 종료 가운데 먼저 오는 때에 시작한다.
-# 그런 신호가 없어도 WAIT_GUARD_S가 지나면 시작한다: 30분 idle pause 전에 lease를 잡고, 신호를 놓친 잡도 끝을 알아챈다.
+# 그런 신호가 없어도 WAIT_GUARD_S가 지나면 시작한다: 잠드는 박스(instabox 30분 idle pause)는 그 전에 lease를 잡고,
+# 신호를 놓친 잡도 끝을 알아챈다.
 # relay가 아직 안 떴거나 끊겨 있는 동안에는(대기줄 대기·설치 중 실패 등 ended가 올 수 없는 때) 1분마다 상태만 한 번 본다.
 wait_go = threading.Event()
 relay_up = threading.Event()
@@ -75,8 +79,8 @@ def save_state(**kw) -> None:
 
 
 def q(*args: str, timeout: float = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(["instabox-q", "-b", ALIAS, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          env=QENV, timeout=timeout)
+    """박스 드라이버 한 번 실행(동사부터)."""
+    return subprocess.run([DRIVER, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=DENV, timeout=timeout)
 
 
 def last_json(text: str) -> dict | None:
@@ -331,8 +335,8 @@ def outbox_loop() -> None:
 def forward_loop() -> None:
     """port-forward는 끊기면 다시 띄운다(분리일 뿐 취소가 아니다)."""
     while not stop.is_set():
-        p = subprocess.Popen(["instabox-q", "-b", ALIAS, "cli", "port-forward", MACHINE, f"{LPORT}:10101"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=QENV)
+        p = subprocess.Popen([DRIVER, "forward", str(LPORT), "10101"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=DENV)
         while not stop.is_set() and p.poll() is None:
             time.sleep(1)
         if p.poll() is None:
@@ -346,18 +350,19 @@ def forward_loop() -> None:
 
 
 def queue_state() -> tuple[str | None, str | None]:
-    """대기줄 작업 상태와 종료값(모르면 None). instabox-q status 한 번."""
+    """대기줄 작업 상태와 종료값(모르면 None). 드라이버 status 한 번: {"state": ..., "exit": ...}."""
     try:
-        txt = q("status", CFG["qid"], timeout=120).stdout.decode("utf-8", "replace")
+        res = last_json(q("status", CFG["qid"], timeout=120).stdout.decode("utf-8", "replace"))
     except subprocess.TimeoutExpired:
         return None, None
-    m = re.search(r"^state=(\w+)", txt, re.M)
-    ec = re.search(r"^exit_code=(\S*)", txt, re.M)
-    return (m.group(1) if m else None), (ec.group(1) if ec else None)
+    if not res:
+        return None, None
+    st, ec = res.get("state"), res.get("exit")
+    return (st if isinstance(st, str) and st != "unknown" else None), (str(ec) if ec is not None else None)
 
 
 def wait_loop() -> None:
-    """instabox-q wait이 끝나면 상태를 확인한다. wait 자체의 실패(망)는 다시 붙는다."""
+    """드라이버 wait이 끝나면 상태를 확인한다. wait 자체의 실패(망)는 다시 붙는다."""
     started = peeked = time.monotonic()
     while not stop.is_set() and not wait_go.wait(1):
         now = time.monotonic()
@@ -369,8 +374,8 @@ def wait_loop() -> None:
                 break
     save_state(wait_started=round(time.monotonic() - started, 1))
     while not stop.is_set():
-        p = subprocess.Popen(["instabox-q", "-b", ALIAS, "wait", CFG["qid"]], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, env=QENV)
+        p = subprocess.Popen([DRIVER, "wait", CFG["qid"]], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=DENV)
         p.wait()
         qstate, ec = queue_state()
         if qstate in ("done", "failed", "cancelled"):
@@ -385,7 +390,7 @@ def finish() -> None:
     save_state(phase="fetching")
     dest = os.path.join(SPOOL, "fetch")
     for _ in range(3):
-        r = q("fetch", f"/data/workspace/rt/{JOB}/out", dest, "--max-bytes", str(700 << 20), timeout=1800)
+        r = q("fetch", f"/data/workspace/rt/{JOB}/out", dest, str(700 << 20), timeout=1800)
         if r.returncode == 0:
             break
         time.sleep(10)
@@ -415,7 +420,7 @@ def finish() -> None:
 
 
 def unit_cpu_s() -> float | None:
-    """AC-11 측정용: 이 pump 유닛 cgroup 전체(아직 도는 instabox port-forward 포함)의 CPU 초.
+    """원점 부하 측정용: 이 pump 유닛 cgroup 전체(아직 도는 드라이버 forward 포함)의 CPU 초.
     cgroup을 읽지 못하면 pump 자신과 거둔 자식의 rusage로 대신한다."""
     try:
         with open("/proc/self/cgroup", encoding="ascii") as f:
@@ -431,7 +436,7 @@ def unit_cpu_s() -> float | None:
 
 
 def release_check() -> None:
-    r = q("cli", "exec", MACHINE, "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "release-check", JOB, str(GEN),
+    r = q("exec", "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "release-check", JOB, str(GEN),
           timeout=180)
     res = last_json(r.stdout.decode("utf-8", "replace"))
     with state_lock:

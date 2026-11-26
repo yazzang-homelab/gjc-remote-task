@@ -3,7 +3,8 @@
 # 사용: deploy/stage-box.sh   (RT_TEST_HUB는 쓰지 않는다: 박스의 모델 주소는 늘 같은 scope의 relay다)
 #   원격 agent 템플릿은 config.yml rtKey.allowedModels(<provider>/<model>)와 메인 models.yml(RT_MODELS_YML)에서 뽑는다.
 #   투입 전 검사용 비밀 지문: $RT/fingerprints.jsonl, RT_FINGERPRINT_CMD, gh 토큰(gh가 있으면), $RT/keys/gjc-rt.key.
-# 결과: ~/.gjc/agent/remote-task/box/{bundle-<판>.tar, rt-boxctl, job.sh.tmpl, rt-boxpump.py, rtlib.py, box.json, fingerprints.json}
+# 결과: ~/.gjc/agent/remote-task/box/{bundle-<판>.tar, rt-boxctl, job.sh.tmpl, rt-boxpump.py, rtlib.py, box.json, fingerprints.json,
+#        drivers/rt-box-<driver>}
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 RT=${GJC_RT_HOME:-$HOME/.gjc/agent/remote-task}
@@ -36,6 +37,9 @@ install -m 0700 "$HERE/worker/box/rt-boxctl" "$RT/box/rt-boxctl"
 install -m 0600 "$HERE/worker/box/job.sh.tmpl" "$RT/box/job.sh.tmpl"
 install -m 0700 "$HERE/worker/box/rt-boxpump.py" "$RT/box/rt-boxpump.py"
 install -m 0600 "$HERE/worker/bundle/rtlib.py" "$RT/box/rtlib.py"
+# 박스 드라이버(VM 종류별 접속·투입·회수). config.yml 박스 대상의 driver로 고른다.
+install -d -m 0700 "$RT/box/drivers"
+for drv in "$HERE"/worker/box/drivers/rt-box-*; do install -m 0700 "$drv" "$RT/box/drivers/$(basename "$drv")"; done
 BSHA=$(sha256sum "$RT/box/rt-boxctl" | cut -d' ' -f1)
 cat > "$RT/box/box.json.new" <<JSON
 {"bundle_ver": "$BVER", "bundle_tar": "bundle-$BVER.tar", "tar_sha": "$TSHA", "boxctl_sha": "$BSHA",

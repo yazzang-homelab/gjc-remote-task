@@ -10,7 +10,7 @@
 
 - **대상 두 가지**
   - *신뢰 작업 호스트(SSH)*: 직접 설치해서 씁니다.
-  - *공개 작업용 박스(선택)*: 일회용 [instabox.sh](https://instabox.sh) microVM입니다. 신뢰하지 않는 곳으로 보고 공개 저장소만 돌리며, 자격 증명은 절대 보내지 않습니다.
+  - *공개 작업용 박스(선택)*: 일회용 클라우드 VM입니다. 신뢰하지 않는 곳으로 보고 공개 저장소만 돌리며, 자격 증명은 절대 보내지 않습니다. VM과는 작은 드라이버가 말합니다. `ssh` 드라이버는 SSH로 닿는 아무 VM(EC2·GCE·Hetzner·DigitalOcean 등)에, `instabox` 드라이버는 [instabox.sh](https://instabox.sh) microVM에 씁니다.
 - **도구 하나로 작업 전 과정을 다룹니다**
   - `plan`: 로컬 부하, 후보 대상, 탈락 사유를 보여 줍니다. 대상은 호출하는 쪽이 고릅니다.
   - `start`: 커밋된 `HEAD`(또는 `base_ref`)를 git bundle로 보냅니다. 원격 executor는 `rt/<job>` 브랜치에서 일합니다.
@@ -31,7 +31,7 @@
  │     ├ state.db(작업)     │ ◀────────────────── │   └ 작업별 systemd 유닛(gjcrt)   │
  │     └ 감시자(깨움)       │   이벤트·bundle     │       rt-runner → gjc executor   │
  └──────────────────────────┘                     └──────────────────────────────────┘
-          │  instabox-q 대기줄 + port-forward(당겨 오기만)
+          │  박스 드라이버: 올리기·투입·port-forward(당겨 오기만)
           ▼
  공개 박스(비신뢰): relay ⇄ 원점의 pump ⇄ 모델 허브(키는 원점에만)
 ```
@@ -48,7 +48,7 @@
   - 작업 호스트에 넣는 전용 허브 키도 같은 방식으로 지문을 둡니다.
 - **박스 모드**
   - 보내기 전에 원점이 확인합니다. 저장소의 GitHub 원본이 공개(익명 API)인지, 기준 커밋이 공개 저장소에 있는지 봅니다. 그다음 아직 push하지 않은 커밋과 작업 지시문에서 토큰 모양과 지문을 검사합니다.
-  - 박스는 원점에 접속할 수 없습니다. 원점의 pump가 `instabox port-forward`로 박스 relay의 모델 요청을 당겨 와 허브로 보냅니다. 키는 원점 밖으로 나가지 않습니다.
+  - 박스는 원점에 접속할 수 없습니다. 원점의 pump가 드라이버의 포트 포워딩으로 박스 relay의 모델 요청을 당겨 와 허브로 보냅니다. 키는 원점 밖으로 나가지 않습니다.
   - 박스는 `needs: [docker|sudo]` 작업과 박스의 남은 실행 시간을 넘길 작업을 거절합니다.
 
 ## 요구 사항
@@ -56,7 +56,7 @@
 - **원점**: `gjc` 0.22 이상과 Bun, `git`, `ssh`, Python 3.10 이상.
 - **작업 호스트**: systemd(cgroup v2)가 있는 Linux, OpenSSH, `sudo` 1.9.10 이상(정규식 규칙), `git`, Python 3.10 이상. 원점과 CPU 아키텍처가 같아야 합니다. 원점이 자기 `gjc` 실행 파일을 올리고, 작업 호스트가 고정된 SHA-256으로 확인하기 때문입니다. Debian 13에서 개발했습니다.
 - **모델 허브**: OpenAI 호환 모델 엔드포인트와, 정한 모델만 허용하는 작업 호스트 전용 API 키.
-- **박스 전송(선택)**: `instabox` CLI와 `instabox-q` 대기줄 도구. `instabox-q`는 이 저장소에 없습니다. 없으면 SSH 대상만 설정하세요.
+- **박스(선택)**: systemd가 있는 x86_64 리눅스 VM. 접속 계정의 비밀번호 없는 `sudo`, `python3`·`git`·`curl`·`tar`가 필요합니다. `ssh` 드라이버는 원점에 `ssh`만 있으면 되고, VM 호스트 키를 `~/.ssh/known_hosts`에 미리 넣어 둡니다. `instabox` 드라이버는 `instabox` CLI와 `instabox-q` 대기줄 도구가 필요하며, `instabox-q`는 이 저장소에 없습니다. 자세한 내용은 [worker/box/drivers/README.md](worker/box/drivers/README.md)를 보세요.
 
 ## 설치
 
@@ -103,7 +103,7 @@ bash deploy/sync.sh             # extension/을 ~/.gjc/agent/extensions/remote-t
 
 ### 3. 박스(선택)
 
-`config.yml`에 `kind: box` 대상과 `box:` 항목을 넣고 `bash deploy/stage-box.sh`를 실행합니다. 박스 풀 원장이 그 원점의 로컬 상태에 있으므로, 박스는 원점 한 곳에만 설정합니다.
+`config.yml`에 `driver`(기본 `ssh`)를 적은 `kind: box` 대상과 `box:` 항목을 넣고 `bash deploy/stage-box.sh`를 실행합니다. 다른 사업자를 쓰려면 [worker/box/drivers/README.md](worker/box/drivers/README.md)의 동사를 구현한 드라이버를 만듭니다. 박스 풀 원장이 그 원점의 로컬 상태에 있으므로, 박스는 원점 한 곳에만 설정합니다.
 
 ## 사용
 
@@ -123,7 +123,7 @@ bash deploy/sync.sh             # extension/을 ~/.gjc/agent/extensions/remote-t
 
 ## 측정 결과
 
-홈랩 한 곳에서 잰 값입니다. 원점은 Intel Xeon E-2124G이고, 작업 호스트 두 대와 4 vCPU 박스 하나를 썼습니다. 모든 작업은 실제 허브를 거쳐 실제 모델로 돌렸습니다. 조합마다 로컬 실행(L)과 원격 실행(R)을 짝지어 5회 이상 돌렸고, 표의 값은 중앙값입니다.
+홈랩 한 곳에서 잰 값입니다. 원점은 Intel Xeon E-2124G이고, 작업 호스트 두 대와 4 vCPU instabox.sh 박스(`instabox` 드라이버) 하나를 썼습니다. 모든 작업은 실제 허브를 거쳐 실제 모델로 돌렸습니다. 조합마다 로컬 실행(L)과 원격 실행(R)을 짝지어 5회 이상 돌렸고, 표의 값은 중앙값입니다.
 
 | 대상 | 원격 작업이 쓰는 로컬 CPU(R ÷ L) | 실행 시간(R ÷ L) |
 |---|---|---|
@@ -137,7 +137,7 @@ SSH 실행 시간 비율에서는 원격 러너가 `checks`를 다시 돌린 시
 - 코드 주석, 도구 설명, 원격 역할 문서(`worker/bundle/role.md`)가 한국어이고, 원격 executor는 한국어로 보고하라는 지시를 받습니다. 바꾸려면 `role.md`를 고치세요.
 - `executor` 성격의 작업만 지원합니다. 원격 쪽은 다른 에이전트에게 위임하지 않습니다.
 - SSH 작업 호스트는 root 설치, systemd, sudo가 필요합니다. systemd 없는 컨테이너는 지원하지 않습니다.
-- 박스 전송은 instabox.sh와 공개되지 않은 `instabox-q` 도구에 의존합니다.
+- 위의 박스 수치는 `instabox` 드라이버로 잰 것입니다. `ssh` 드라이버는 실제 클라우드 VM에서 가짜 모델 허브로 잡 전체(질문·답 잡과 취소한 잡, 둘 다 회수까지)를 확인했지만 성능은 재지 않았습니다.
 
 ## 개발
 

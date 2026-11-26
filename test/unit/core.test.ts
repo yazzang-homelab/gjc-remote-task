@@ -308,7 +308,7 @@ describe("box rules", () => {
 		origin: "pve3",
 		targets: {
 			lab: { kind: "ssh" as const, host: "l", user: "u", port: 22, maxSlots: 3, loadMax: 0.7 },
-			box2: { kind: "box" as const, alias: "gjc-box-2", machine: "m2", maxSlots: 1 },
+			box2: { kind: "box" as const, driver: "ssh", host: "203.0.113.10", maxSlots: 1 },
 		},
 		gjcVersion: "0.22.0",
 		gjcBinary: "/x",
@@ -381,11 +381,13 @@ describe("loadConfig", () => {
 		const bin = join(d, "gjc");
 		writeFileSync(bin, "#!/bin/sh\necho gjc/9.8.7\n", { mode: 0o755 });
 		const path = join(d, "config.yml");
-		writeFileSync(path, `origin: main\ngjcBinary: ${bin}\ntargets:\n  w1: { host: w1.example.net, maxSlots: 3 }\n  b1: { kind: box, alias: a, machine: m }\n`);
+		writeFileSync(path, `origin: main\ngjcBinary: ${bin}\ntargets:\n  w1: { host: w1.example.net, maxSlots: 3 }\n  b1: { kind: box, alias: a, machine: m, driver: instabox }\n  b2: { kind: box, host: vm.example.net }\n`);
 		const c = loadConfig(path);
 		expect(c.gjcVersion).toBe("9.8.7");
 		expect(c.targets.w1).toEqual({ kind: "ssh", host: "w1.example.net", user: "gjcrt-ctl", port: 22, maxSlots: 3, loadMax: 0.7 });
-		expect(c.targets.b1).toEqual({ kind: "box", alias: "a", machine: "m", maxSlots: 1 });
+		expect(c.targets.b1).toEqual({ kind: "box", driver: "instabox", alias: "a", machine: "m", maxSlots: 1 });
+		// 박스 드라이버를 적지 않으면 일반 SSH VM이다.
+		expect(c.targets.b2).toEqual({ kind: "box", driver: "ssh", host: "vm.example.net", maxSlots: 1 });
 		writeFileSync(path, "gjcBinary: ~/no-such-gjc\n");
 		expect(loadConfig(path).gjcBinary.endsWith("/no-such-gjc")).toBe(true);
 		expect(loadConfig(path).gjcVersion).toBe("");

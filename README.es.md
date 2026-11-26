@@ -10,7 +10,7 @@ Una extensión de [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`
 
 - **Dos tipos de destino**
   - *Hosts de trabajo SSH de confianza* que tú mismo aprovisionas.
-  - *Boxes para trabajo público* (opcionales): microVM desechables de [instabox.sh](https://instabox.sh), tratadas como no confiables. Solo ejecutan repositorios públicos y nunca reciben credenciales.
+  - *Boxes para trabajo público* (opcionales): VM desechables en la nube, tratadas como no confiables. Solo ejecutan repositorios públicos y nunca reciben credenciales. Un pequeño driver habla con la VM: `ssh` sirve para cualquier VM accesible por SSH (EC2, GCE, Hetzner, DigitalOcean, ...) e `instabox` para las microVM de [instabox.sh](https://instabox.sh).
 - **El ciclo de vida completo en una sola herramienta**
   - `plan` muestra la carga local, los destinos candidatos y por qué se descartó alguno. Tú eliges el destino.
   - `start` envía un git bundle de un `HEAD` confirmado (o de `base_ref`). El executor remoto trabaja en la rama `rt/<job>`.
@@ -31,7 +31,7 @@ Una extensión de [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`
  │     ├ state.db (trabajos)│ ◀────────────────── │   └ unidad systemd por trabajo   │
  │     └ vigilante (avisos) │  eventos / bundle   │       rt-runner → gjc executor   │
  └──────────────────────────┘                     └──────────────────────────────────┘
-          │  cola instabox-q + port-forward (solo extracción)
+          │  driver de box: subida, envío, port-forward (solo extracción)
           ▼
  box pública (no confiable): relay ⇄ pump en el origen ⇄ hub de modelos (la clave queda en el origen)
 ```
@@ -48,7 +48,7 @@ Una extensión de [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`
   - La clave dedicada del hub de modelos en el host se registra de la misma forma.
 - **Modo box**
   - Antes de enviar, el origen comprueba que el origen de GitHub del repositorio sea público (API anónima) y que el commit base exista en el repositorio público. Después analiza los commits sin publicar y el texto de la tarea en busca de patrones de tokens y huellas.
-  - La box no puede conectarse de vuelta. Un pump en el origen extrae las peticiones al modelo del relay de la box mediante `instabox port-forward` y las reenvía al hub con la clave, que nunca sale del origen.
+  - La box no puede conectarse de vuelta. Un pump en el origen extrae las peticiones al modelo del relay de la box mediante el reenvío de puertos del driver y las reenvía al hub con la clave, que nunca sale del origen.
   - Las boxes rechazan `needs: [docker|sudo]` y los trabajos que excederían el tiempo de ejecución restante de la box.
 
 ## Requisitos
@@ -56,7 +56,7 @@ Una extensión de [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`
 - **Origen:** `gjc` ≥ 0.22 con Bun, `git`, `ssh` y Python 3.10+.
 - **Host de trabajo:** Linux con systemd (cgroup v2), OpenSSH, `sudo` ≥ 1.9.10 (por la regla con expresión regular), `git` y Python 3.10+. Misma arquitectura de CPU que el origen, porque el origen sube su propio binario de `gjc` y el host lo verifica contra un SHA-256 fijado. Desarrollado en Debian 13.
 - **Hub de modelos:** un endpoint de modelos compatible con OpenAI y una clave de API dedicada a los hosts de trabajo que solo permita los modelos que indiques.
-- **Transporte box (opcional):** la CLI `instabox` y una herramienta de cola `instabox-q`. `instabox-q` no forma parte de este repositorio; sin ella, configura solo destinos SSH.
+- **Box (opcional):** una VM Linux x86_64 con systemd, `sudo` sin contraseña para la cuenta de acceso, `python3`, `git`, `curl` y `tar`. El driver `ssh` solo necesita `ssh` en el origen y la clave de host de la VM en `~/.ssh/known_hosts`. El driver `instabox` necesita la CLI `instabox` y una herramienta de cola `instabox-q`, que no forma parte de este repositorio. Consulta [worker/box/drivers/README.md](worker/box/drivers/README.md).
 
 ## Instalación
 
@@ -103,7 +103,7 @@ Para revertir un host de trabajo, ejecuta `deploy/rollback-worker.sh` como root 
 
 ### 3. Boxes (opcional)
 
-Añade un destino `kind: box` y la sección `box:` a `config.yml`, y luego ejecuta `bash deploy/stage-box.sh`. Configura las boxes en un solo origen, porque el registro del grupo de boxes vive en el estado local de ese origen.
+Añade a `config.yml` un destino `kind: box` con un `driver` (`ssh` por defecto) y la sección `box:`, y luego ejecuta `bash deploy/stage-box.sh`. Para otro proveedor, escribe un driver que implemente los verbos de [worker/box/drivers/README.md](worker/box/drivers/README.md). Configura las boxes en un solo origen, porque el registro del grupo de boxes vive en el estado local de ese origen.
 
 ## Uso
 
@@ -123,7 +123,7 @@ La herramienta solo está disponible en la sesión **principal**. Llamadas típi
 
 ## Resultados medidos
 
-Estos datos provienen de un único homelab: un origen Intel Xeon E-2124G, dos hosts de trabajo y una box de 4 vCPU. Todos los trabajos usaron un modelo real a través de un hub real. Cada configuración se ejecutó al menos 5 rondas emparejando una ejecución local (L) con la remota (R). La tabla muestra medianas.
+Estos datos provienen de un único homelab: un origen Intel Xeon E-2124G, dos hosts de trabajo y una box de instabox.sh con 4 vCPU (driver `instabox`). Todos los trabajos usaron un modelo real a través de un hub real. Cada configuración se ejecutó al menos 5 rondas emparejando una ejecución local (L) con la remota (R). La tabla muestra medianas.
 
 | Destino | CPU local usada por un trabajo remoto (R ÷ L) | Tiempo de reloj (R ÷ L) |
 |---|---|---|
@@ -137,7 +137,7 @@ La relación de tiempo SSH excluye el tiempo que el ejecutor remoto dedica a rep
 - Los comentarios del código, la descripción de la herramienta y el prompt de rol remoto (`worker/bundle/role.md`) están en coreano, y al executor remoto se le indica que informe en coreano. Edita `role.md` para cambiarlo.
 - Solo se admite trabajo de tipo `executor`. El lado remoto no delega en otros agentes.
 - Los hosts SSH requieren aprovisionamiento como root, systemd y sudo. No se admiten contenedores sin systemd.
-- El transporte box depende de instabox.sh y de la herramienta `instabox-q`, que no está publicada.
+- Las cifras de box de arriba usan el driver `instabox`. El driver `ssh` se comprobó de extremo a extremo en una VM real en la nube con un hub de modelos simulado (un trabajo con pregunta y respuesta y otro cancelado, ambos recogidos), pero no tiene mediciones de rendimiento.
 
 ## Desarrollo
 

@@ -77,7 +77,7 @@ export function githubSlug(url: string | null): string | null {
 	return m ? `${m[1]}/${m[2]}` : null;
 }
 
-/** 익명 API로 공개 여부를 본다(instabox-q 투입 검사와 같은 방식). 연결 실패는 공개로 보지 않는다. */
+/** 익명 API로 공개 여부를 본다(박스 투입 전 검사). 연결 실패는 공개로 보지 않는다. */
 export async function isPublicRepo(slug: string, fetchImpl: typeof fetch = fetch): Promise<boolean> {
 	try {
 		const r = await fetchImpl(`https://api.github.com/repos/${slug}`, {

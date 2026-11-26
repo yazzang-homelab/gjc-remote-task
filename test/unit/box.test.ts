@@ -4,17 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RtConfig } from "../../extension/core/config";
 import { Store } from "../../extension/core/store";
-import { BoxTransport, boxTimes, type InstaboxRunner } from "../../extension/transport/box";
+import { type BoxDriverRunner, BoxTransport } from "../../extension/transport/box";
 
 let dir: string;
 let store: Store;
 const config: RtConfig = {
-	origin: "pve3",
-	targets: { box2: { kind: "box", alias: "gjc-box-2", machine: "m2", maxSlots: 1 } },
+	origin: "main",
+	targets: { box2: { kind: "box", driver: "ssh", host: "203.0.113.10", maxSlots: 1 } },
 	gjcVersion: "0.22.0",
 	gjcBinary: "/x",
-	defaultModel: "oci-opencodex/devin/swe-2:high",
-	rtKey: { allowedModels: ["oci-opencodex/devin/swe-2"] },
+	defaultModel: "my-hub/my-model:high",
+	rtKey: { allowedModels: ["my-hub/my-model"] },
 	thresholds: { recommendLoad: 0.8, recommendMemFree: 0.2 },
 	retentionDays: 7,
 	sshConnectTimeoutS: 10,
@@ -30,23 +30,17 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-function boxes(state: string, cooldown = 0, left = 300): InstaboxRunner {
-	const calls: string[][] = [];
-	const run: InstaboxRunner = async args => {
-		calls.push(args);
-		if (args.join(" ") === `-b ${target.alias} cli get ${target.machine} --json`) {
-			const cooldownUntil = cooldown ? new Date(Date.now() + cooldown * 1000 + 500).toISOString() : null;
-			return { code: 0, stdout: JSON.stringify({ id: "x", state, cooldownUntil, runStartedAt: null, maxRunMinutes: left }, null, 2), stderr: "" };
-		}
+function boxes(state: string, cooldown = 0, left: number | null = 300): BoxDriverRunner {
+	return async args => {
+		if (args.join(" ") === "info") return { code: 0, stdout: `${JSON.stringify({ state, cooldown_s: cooldown, run_left_min: left })}\n`, stderr: "" };
 		return { code: 1, stdout: "", stderr: "unexpected" };
 	};
-	return run;
 }
 
 describe("BoxTransport.probe (박스를 깨우지 않는다)", () => {
 	test("상태·쿨다운·잔여 시간·묶음·키", async () => {
 		const t = new BoxTransport("box2", target, dir, config, store, boxes("stopped", 30, 20));
-		const p = await t.call("probe", ["--model", "oci-opencodex/devin/swe-2", "--est", "15"]);
+		const p = await t.call("probe", ["--model", "my-hub/my-model", "--est", "15"]);
 		expect(p.admission).toEqual(["box_unavailable", "box_cooldown", "box_runtime_short", "box_bundle_missing"]);
 		expect(p.credential).toBe(false);
 		writeFileSync(join(dir, "box", "box.json"), "{}");
@@ -57,17 +51,28 @@ describe("BoxTransport.probe (박스를 깨우지 않는다)", () => {
 	});
 });
 
-describe("boxTimes (instabox get → 쿨다운·남은 실행 시간)", () => {
-	const now = Date.parse("2026-11-26T00:00:00Z");
-	test("실행 중이면 한도에서 지난 시간을 빼고, 잠든 박스는 깨우면 새 실행이라 한도 전체다", () => {
-		const m = { state: "running", runStartedAt: "2026-11-25T23:00:30Z", maxRunMinutes: 120, cooldownUntil: null };
-		expect(boxTimes(m, now)).toEqual({ state: "running", cooldownSeconds: 0, runLeftMinutes: 60 });
-		expect(boxTimes({ ...m, state: "suspended" }, now).runLeftMinutes).toBe(120);
-		expect(boxTimes({ ...m, runStartedAt: "2026-11-25T21:00:00Z" }, now).runLeftMinutes).toBe(0);
+describe("BoxTransport 드라이버", () => {
+	test("드라이버 info를 못 읽으면 unreachable, 한도 없는 VM(null)은 잔여 시간 거절이 없다", async () => {
+		const down: BoxDriverRunner = async () => ({ code: 2, stdout: "", stderr: "" });
+		expect(await new BoxTransport("box2", target, dir, config, store, down).call<unknown>("probe", ["--est", "15"])).toEqual({ error: "unreachable" });
+		writeFileSync(join(dir, "box", "box.json"), "{}");
+		const p = await new BoxTransport("box2", target, dir, config, store, boxes("running", 0, null)).call("probe", ["--est", "600"]);
+		expect(p.admission).toEqual([]);
+		expect(p.box).toEqual({ state: "running", run_left_min: null, cooldown_s: 0 });
 	});
-	test("쿨다운은 남은 초(지났으면 0), 한도가 없으면 null", () => {
-		expect(boxTimes({ state: "stopped", cooldownUntil: "2026-11-26T00:01:30Z", maxRunMinutes: 0 }, now)).toEqual({ state: "stopped", cooldownSeconds: 90, runLeftMinutes: null });
-		expect(boxTimes({ state: "stopped", cooldownUntil: "2026-11-25T23:59:00Z" }, now).cooldownSeconds).toBe(0);
+
+	test("설치된 드라이버가 없으면 box_driver_missing, 이름이 규칙 밖이면 bad_target", async () => {
+		expect(await new BoxTransport("box2", target, dir, config, store).call<unknown>("probe", [])).toEqual({ error: "box_driver_missing" });
+		const bad = { ...target, driver: "../x" };
+		await expect(new BoxTransport("box2", bad, dir, config, store).call("probe", [])).rejects.toThrow("bad_target");
+	});
+
+	test("드라이버 실행 파일에 대상 설정을 RT_BOX_TARGET으로 넘긴다", async () => {
+		mkdirSync(join(dir, "box", "drivers"), { recursive: true });
+		const drv = join(dir, "box", "drivers", "rt-box-ssh");
+		writeFileSync(drv, `#!/bin/sh\n[ "$1" = info ] || exit 9\nprintf '{"state":"running","cooldown_s":0,"run_left_min":%s}\\n' "$(printf %s "$RT_BOX_TARGET" | grep -c 203.0.113.10)"\n`, { mode: 0o700 });
+		const p = await new BoxTransport("box2", target, dir, config, store).call("probe", ["--est", "15"]);
+		expect(p.box.run_left_min).toBe(1);
 	});
 });
 

@@ -14,14 +14,16 @@ export interface SshTarget {
 	loadMax: number;
 }
 
-/** 박스(instabox.sh microVM) 대상. 박스 풀 원장이 이 호스트 상태 DB에 있으므로 박스는 원점 한 곳에만 설정한다. */
+/** 박스(신뢰하지 않는 일회용 클라우드 VM) 대상. 박스 풀 원장이 이 호스트 상태 DB에 있으므로
+ * 박스는 원점 한 곳에만 설정한다. VM과 말하는 방법은 드라이버(worker/box/drivers/rt-box-<driver>)가 맡는다.
+ * 드라이버는 이 객체 전체를 환경 변수 RT_BOX_TARGET(JSON)으로 받는다.
+ * - ssh: host(필수), user, port, identityFile, sshConfig, maxRunMinutes(있으면 잔여 시간 판단에 쓴다)
+ * - instabox: alias(instabox-q 별칭), machine(instabox 머신 이름) */
 export interface BoxTarget {
 	kind: "box";
-	/** instabox-q 별칭 */
-	alias: string;
-	/** instabox 머신 이름(cli·port-forward용) */
-	machine: string;
+	driver: string;
 	maxSlots: number;
+	[key: string]: unknown;
 }
 
 export type Target = SshTarget | BoxTarget;
@@ -65,7 +67,7 @@ export function loadConfig(path = join(rtHome(), "config.yml")): RtConfig {
 	for (const [name, t] of Object.entries(raw.targets ?? DEFAULTS.targets)) {
 		const base = DEFAULTS.targets[name];
 		const kind = (t as { kind?: string }).kind ?? base?.kind ?? "ssh";
-		const fallback = kind === "box" ? { kind: "box", maxSlots: 1 } : { kind: "ssh", user: "gjcrt-ctl", port: 22, maxSlots: 1, loadMax: 0.7 };
+		const fallback = kind === "box" ? { kind: "box", driver: "ssh", maxSlots: 1 } : { kind: "ssh", user: "gjcrt-ctl", port: 22, maxSlots: 1, loadMax: 0.7 };
 		targets[name] = { ...(base ?? fallback), ...(t as object) } as Target;
 	}
 	const out: RtConfig = {

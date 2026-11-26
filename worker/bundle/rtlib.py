@@ -12,7 +12,7 @@ EVENT_MAX = 16 * 1024
 INBOX_MAX = 64 * 1024
 FINGERPRINTS_PATH = "/etc/gjc-rt/fingerprints.json"
 
-# 토큰 모양 규칙(값 자체는 몰라도 잡는다). instabox-q 투입 검사와 같은 계열.
+# 토큰 모양 규칙(값 자체는 몰라도 잡는다). 박스 투입 전 검사와 같은 계열.
 TOKEN_RULES = [
     ("openai_like", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
     ("ocx_key", re.compile(r"\bocx_[A-Za-z0-9_-]{16,}")),

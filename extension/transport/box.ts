@@ -1,6 +1,7 @@
-// 박스 전송: instabox-q(별칭)로 파일 올리기·대기줄 투입·관리 명령, pump 유닛으로 모델·이벤트·inbox 중계.
+// 박스 전송: 박스 드라이버(worker/box/drivers/rt-box-<driver>)로 파일 올리기·작업 투입·관리 명령, pump 유닛으로
+// 모델·이벤트·inbox 중계. 드라이버가 VM 종류(일반 SSH VM, instabox 등)의 차이를 맡고 여기서는 같은 동사만 쓴다.
 // SshTransport와 같은 동사(call)를 제공해 jobs.ts의 흐름을 그대로 쓴다. 박스로 가는 것은 공개 원본 기준의
-// 미push bundle·작업 지시·검증된 코드뿐이고, 키는 원점의 pump만 가진다(계획 §5.2·§5.9·§19~§24).
+// 미push bundle·작업 지시·검증된 코드뿐이고, 키는 원점의 pump만 가진다.
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -11,12 +12,12 @@ import { normalizeModel } from "../core/config";
 import type { Store } from "../core/store";
 import { type CallOptions, RemoteError } from "./ssh";
 
-const QENV = { ...process.env, INSTABOX_NO_TELEMETRY: "1", INSTABOX_NO_UPDATE_CHECK: "1" };
 const LIVE_BOX_STATES = new Set(["running", "suspended", "paused", "resuming", "starting"]);
+const DRIVER_RE = /^[a-z][a-z0-9-]{0,31}$/;
+/** 드라이버가 돌려주는 대기줄 작업 id(경로·셸에 쓰이지 않지만 모양은 좁힌다). */
+const QID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 interface BoxInfo {
-	alias: string;
-	machine: string;
 	state: string;
 	cooldownSeconds: number;
 	runLeftMinutes: number | null;
@@ -37,18 +38,23 @@ interface RunResult {
 	stderr: string;
 }
 
-export type InstaboxRunner = (args: string[], timeoutMs: number) => Promise<RunResult>;
+/** 드라이버 한 번 실행(인자는 드라이버 동사부터). 시험에서는 가짜로 바꾼다. */
+export type BoxDriverRunner = (args: string[], timeoutMs: number) => Promise<RunResult>;
 
-const defaultRunner: InstaboxRunner = async (args, timeoutMs) => {
-	const proc = Bun.spawn(["instabox-q", ...args], { stdout: "pipe", stderr: "pipe", env: QENV });
-	const timer = setTimeout(() => proc.kill("SIGTERM"), timeoutMs);
-	try {
-		const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-		return { code, stdout, stderr };
-	} finally {
-		clearTimeout(timer);
-	}
-};
+function driverRunner(driver: string, target: BoxTarget): BoxDriverRunner {
+	return async (args, timeoutMs) => {
+		if (!existsSync(driver)) return { code: 127, stdout: "", stderr: `box driver missing: ${driver}` };
+		const env = { ...process.env, RT_BOX_TARGET: JSON.stringify(target) };
+		const proc = Bun.spawn([driver, ...args], { stdout: "pipe", stderr: "pipe", env });
+		const timer = setTimeout(() => proc.kill("SIGTERM"), timeoutMs);
+		try {
+			const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+			return { code, stdout, stderr };
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+}
 
 function lastJson(text: string): Record<string, unknown> | null {
 	for (const line of text.trim().split("\n").reverse()) {
@@ -58,24 +64,6 @@ function lastJson(text: string): Record<string, unknown> | null {
 		} catch {}
 	}
 	return null;
-}
-
-interface MachineInfo {
-	state: string;
-	cooldownUntil?: string | null;
-	runStartedAt?: string | null;
-	maxRunMinutes?: number | null;
-}
-
-/** instabox get 결과 → 상태·쿨다운 남은 초·실행 한도까지 남은 분(한도 없음은 null; 잠든 박스는 깨우면 새 실행이라 한도 전체). */
-export function boxTimes(m: MachineInfo, now: number): { state: string; cooldownSeconds: number; runLeftMinutes: number | null } {
-	const ts = (v?: string | null) => (v ? Date.parse(v) : Number.NaN);
-	const cool = ts(m.cooldownUntil);
-	const cooldownSeconds = Number.isFinite(cool) ? Math.max(0, Math.floor((cool - now) / 1000)) : 0;
-	const cap = m.maxRunMinutes ?? 0;
-	const run = ts(m.runStartedAt);
-	const runLeftMinutes = cap <= 0 ? null : m.state === "running" && Number.isFinite(run) ? Math.max(0, Math.floor(cap - (now - run) / 60_000)) : cap;
-	return { state: m.state, cooldownSeconds, runLeftMinutes };
 }
 
 async function freePort(): Promise<number> {
@@ -97,11 +85,19 @@ export class BoxTransport {
 		readonly home: string,
 		readonly config: RtConfig,
 		readonly store: Store,
-		readonly run: InstaboxRunner = defaultRunner,
+		private run?: BoxDriverRunner,
 	) {}
 
+	/** 원점에 설치된 드라이버 실행 파일(stage-box가 box/drivers/에 둔다). */
+	driverPath(): string {
+		const d = String(this.target.driver ?? "");
+		if (!DRIVER_RE.test(d)) throw new RemoteError("bad_target", `box driver: ${d}`);
+		return join(this.home, "box", "drivers", `rt-box-${d}`);
+	}
+
 	private q(args: string[], timeoutMs = 120_000): Promise<RunResult> {
-		return this.run(["-b", this.target.alias, ...args], timeoutMs);
+		this.run ??= driverRunner(this.driverPath(), this.target);
+		return this.run(args, timeoutMs);
 	}
 
 	private spool(job: string): string {
@@ -141,18 +137,18 @@ export class BoxTransport {
 		for (const job of this.store.boxOpen(this.name)) this.settleRelease(job);
 	}
 
-	/** 이 박스의 상태를 API 한 번으로 읽는다(박스를 깨우지 않음). instabox-q boxes는 모든 박스를 읽어 CPU가 10배쯤 들므로
-	 * 이 박스만 instabox get으로 읽는다. 값 계산은 instabox-q box_info와 같다. */
+	/** 이 박스의 상태(드라이버 info: 박스를 깨우지 않는다). 못 읽으면 null(unreachable). */
 	async boxes(): Promise<BoxInfo | null> {
-		const r = await this.q(["cli", "get", this.target.machine, "--json"], 60_000);
+		const r = await this.q(["info"], 60_000);
 		if (r.code !== 0) return null;
-		let m: MachineInfo | null = null;
-		try {
-			m = JSON.parse(r.stdout) as MachineInfo; // instabox get --json은 여러 줄로 들여 쓴 객체 하나다
-		} catch {
-			return null;
-		}
-		return m && typeof m.state === "string" ? { alias: this.target.alias, machine: this.target.machine, ...boxTimes(m, Date.now()) } : null;
+		const m = lastJson(r.stdout);
+		if (!m || typeof m.state !== "string") return null;
+		const left = m.run_left_min;
+		return {
+			state: m.state,
+			cooldownSeconds: typeof m.cooldown_s === "number" ? m.cooldown_s : 0,
+			runLeftMinutes: typeof left === "number" ? left : null,
+		};
 	}
 
 	async call<T = any>(verb: string, args: (string | number)[], opts: CallOptions = {}): Promise<T> {
@@ -197,6 +193,7 @@ export class BoxTransport {
 	private async probe(a: string[]) {
 		const est = a.includes("--est") ? Number(a[a.indexOf("--est") + 1]) : 30;
 		const model = a.includes("--model") ? a[a.indexOf("--model") + 1]! : this.config.defaultModel;
+		if (!this.run && !existsSync(this.driverPath())) return { error: "box_driver_missing" };
 		const info = await this.boxes();
 		if (!info) return { error: "unreachable" };
 		const admission: string[] = [];
@@ -251,7 +248,7 @@ export class BoxTransport {
 			.replaceAll("@GJC_SHA@", st.gjc_sha);
 		if (/@[A-Z_]+@/.test(script)) throw new RemoteError("template_incomplete");
 		writeFileSync(join(d, "job.sh"), script, { mode: 0o600 });
-		const r = await this.q(["cli", "cp", "-r", "-p", `${up}/.`, `${this.target.machine}:/data/workspace/rt-in/${job}`], 30 * 60_000);
+		const r = await this.q(["put", up, `/data/workspace/rt-in/${job}`], 30 * 60_000);
 		if (r.code !== 0) throw new RemoteError("box_upload_failed", r.stderr.slice(-300));
 		rmSync(up, { recursive: true, force: true });
 		return { ok: true };
@@ -265,9 +262,9 @@ export class BoxTransport {
 		const runLeft = info ? (info.runLeftMinutes ?? 24 * 60) : 0;
 		const minutes = Math.max(10, Math.min(row.est_min * 2, runLeft - 10));
 		const timeoutS = minutes * 60 + 900; // 설치·clone·정리 여유
-		const r = await this.q(["submit", "--name", `rt-${job.slice(3, 19)}`, "--timeout", String(timeoutS), "-f", join(d, "job.sh")], 5 * 60_000);
+		const r = await this.q(["submit", `rt-${job.slice(3, 19)}`, String(timeoutS), join(d, "job.sh")], 5 * 60_000);
 		const qid = r.stdout.trim().split("\n").pop()?.trim() ?? "";
-		if (r.code !== 0 || !/^[0-9T]+-[a-z0-9-]+$/.test(qid)) {
+		if (r.code !== 0 || !QID_RE.test(qid)) {
 			throw new RemoteError(r.code === 3 ? "box_submit_refused" : "box_submit_failed", r.stderr.slice(-300));
 		}
 		const hub = this.config.box.hubBase;
@@ -275,8 +272,8 @@ export class BoxTransport {
 		const pump = {
 			job,
 			gen,
-			alias: this.target.alias,
-			machine: this.target.machine,
+			driver: this.driverPath(),
+			target: this.target,
 			qid,
 			models,
 			hub_base: hub,
@@ -287,6 +284,8 @@ export class BoxTransport {
 		};
 		writeFileSync(join(d, "pump.json"), JSON.stringify(pump), { mode: 0o600 });
 		const unit = `gjc-rt-pump-${job}`;
+		const rwOut = await this.q(["pump-rw"], 30_000);
+		const rw = rwOut.code === 0 ? rwOut.stdout.split("\n").map(l => l.trim()).filter(l => l.startsWith("/") && !/\s/.test(l)) : [];
 		const p = Bun.spawn(
 			[
 				"systemd-run",
@@ -298,15 +297,13 @@ export class BoxTransport {
 				"-p",
 				"ProtectHome=read-only",
 				"-p",
-				// instabox port-forward는 ~/.config/instabox/ssh에 연결 설정을 쓴다.
-				`ReadWritePaths=${d} -${join(homedir(), ".config", "instabox")}`,
+				// 드라이버가 쓰기를 요구하는 경로(예: instabox port-forward의 연결 설정)는 없어도 되는 경로(-)로 연다.
+				`ReadWritePaths=${[d, ...rw.map(p => `-${p}`)].join(" ")}`,
 				`--setenv=HOME=${homedir()}`,
 				"-p",
 				"PrivateTmp=yes",
 				"-p",
 				`RuntimeMaxSec=${Math.ceil(timeoutS + 7200)}`,
-				"--setenv=INSTABOX_NO_TELEMETRY=1",
-				"--setenv=INSTABOX_NO_UPDATE_CHECK=1",
 				"/usr/bin/python3",
 				join(this.home, "box", "rt-boxpump.py"),
 				d,
@@ -422,12 +419,11 @@ export class BoxTransport {
 		// pump가 대기줄 작업 감시를 바로 시작하게 한다(평소에는 러너 종료 신호를 받고서야 시작한다).
 		writeFileSync(join(d, "wait-now"), "");
 		// 봉인 먼저(늦은 시작 차단), 그다음 대기줄 취소(job.sh trap이 유닛을 멈추고 결과를 모은다).
-		const r = await this.q(["cli", "exec", this.target.machine, "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "cancel", job, String(gen)], 6 * 60_000);
+		const r = await this.q(["exec", "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "cancel", job, String(gen)], 6 * 60_000);
 		const res = lastJson(r.stdout);
-		const qc = await this.q(["cancel", pump.qid], 120_000);
-		// 대기줄의 cancel은 pending 파일 삭제와 워커의 pending→running 이동 중 하나만 성공한다.
-		// "cancelled pending"이면 job.sh가 한 번도 실행되지 않았다(미시작 증명).
-		const pendingCancelled = /cancelled pending/.test(qc.stdout);
+		const qc = lastJson((await this.q(["cancel", pump.qid], 120_000)).stdout);
+		// 드라이버가 "시작 전에 대기줄에서 뺐다"고 답하면 job.sh가 한 번도 실행되지 않았다(미시작 증명).
+		const pendingCancelled = qc?.pending_cancelled === true;
 		let release = res && typeof res.release === "boolean" ? (res as { release: boolean; proof?: string }) : null;
 		if (!release?.release && pendingCancelled) release = { release: true, proof: "queue_pending_cancelled" };
 		if (release?.release) this.store.boxRelease(job, release.proof ?? "ended");
@@ -436,7 +432,7 @@ export class BoxTransport {
 		while (Date.now() < deadline && this.pumpState(job)?.phase !== "done") await Bun.sleep(1000);
 		this.settleRelease(job);
 		const ended = !!release?.release || this.pumpState(job)?.phase === "done";
-		return { ok: !!res && !res.error, sealed: res?.sealed ?? false, ended, release, queue: qc.stdout.trim().slice(-200), error: res?.error };
+		return { ok: !!res && !res.error, sealed: res?.sealed ?? false, ended, release, queue: String(qc?.detail ?? "").slice(-200), error: res?.error };
 	}
 
 	// ---------------------------------------------------------------- 결과
@@ -467,7 +463,7 @@ export class BoxTransport {
 		const gen = slot?.gen ?? 1;
 		const d = this.spool(job);
 		if (existsSync(join(d, "pump.json"))) {
-			const r = await this.q(["cli", "exec", this.target.machine, "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "cleanup", job, String(gen)], 10 * 60_000);
+			const r = await this.q(["exec", "--", "sudo", "-n", "/data/rt-ctl/bin/rt-boxctl", "cleanup", job, String(gen)], 10 * 60_000);
 			const res = lastJson(r.stdout);
 			if (!res?.ok) throw new RemoteError((res?.error as string) ?? "cleanup_failed", String(res?.detail ?? r.stderr.slice(-200)));
 			this.settleRelease(job);
@@ -475,7 +471,7 @@ export class BoxTransport {
 			this.store.boxRelease(job, "cleaned");
 		} else {
 			// 투입 전이었다. 올린 파일만 지운다(박스에 있으면).
-			await this.q(["cli", "exec", this.target.machine, "--", "rm", "-rf", "--", `/data/workspace/rt-in/${job}`], 120_000);
+			await this.q(["exec", "--", "rm", "-rf", "--", `/data/workspace/rt-in/${job}`], 120_000);
 			this.store.boxRelease(job, "never_submitted");
 		}
 		Bun.spawnSync(["systemctl", "stop", `gjc-rt-pump-${job}.service`], { stdout: "ignore", stderr: "ignore" });

@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+"""gjc-rt 박스 드라이버: SSH로 닿는 일반 클라우드 VM(EC2·GCE·Hetzner·DigitalOcean·자체 VM 등).
+
+원점의 확장(box.ts)과 pump(rt-boxpump.py)가 이 프로그램으로만 VM과 말한다. 계약은 worker/box/drivers/README.md.
+대상 설정은 환경 변수 RT_BOX_TARGET(JSON)으로 받는다: host(필수), user, port, identityFile, sshConfig, connectTimeoutS.
+
+VM 요구 사항: systemd 리눅스, 접속 계정의 비밀번호 없는 sudo, python3·git·curl·tar.
+대기줄은 따로 두지 않는다. 잡마다 시스템 유닛 rtq-<이름>(접속 계정으로 실행)을 하나 띄우고,
+잡 폴더 /data/workspace/rt-q/<이름>/의 rc(종료값)·cancelled 표식으로 상태를 판정한다.
+VM이 보낸 데이터(fetch)는 신뢰하지 않는다: 일반 파일·폴더만, 상대 경로만, 상한까지만 받는다.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tarfile
+import time
+
+QROOT = "/data/workspace/rt-q"
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+REMOTE_RE = re.compile(r"/data/workspace/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*")
+HOST_RE = re.compile(r"[A-Za-z0-9._:-]{1,253}")
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+TERMINAL = ("done", "failed", "cancelled")
+
+
+def die(code: str, detail: str = "", rc: int = 2) -> None:
+    sys.stderr.write(f"{code}{': ' + detail if detail else ''}\n")
+    sys.exit(rc)
+
+
+def target() -> dict:
+    try:
+        t = json.loads(os.environ.get("RT_BOX_TARGET") or "{}")
+    except ValueError:
+        die("bad_target", "RT_BOX_TARGET")
+    if not isinstance(t, dict) or not isinstance(t.get("host"), str) or not HOST_RE.fullmatch(t["host"]):
+        die("bad_target", "host")
+    if t.get("user") is not None and not (isinstance(t["user"], str) and USER_RE.fullmatch(t["user"])):
+        die("bad_target", "user")
+    return t
+
+
+def ssh_argv(extra: list[str] | None = None) -> list[str]:
+    t = target()
+    a = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={int(t.get('connectTimeoutS', 10))}",
+         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+         # 박스는 신뢰하지 않는다: 호스트 키는 미리 등록한 것만, 에이전트·X11 전달과 LocalCommand는 끌다(~/.ssh/config보다 앞선다).
+         "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ForwardX11=no", "-o", "PermitLocalCommand=no"]
+    if t.get("sshConfig"):
+        a += ["-F", os.path.expanduser(str(t["sshConfig"]))]
+    if t.get("identityFile"):
+        a += ["-i", os.path.expanduser(str(t["identityFile"])), "-o", "IdentitiesOnly=yes"]
+    if t.get("port"):
+        a += ["-p", str(int(t["port"]))]
+    a += extra or []
+    a += ["--", f"{t['user']}@{t['host']}" if t.get("user") else t["host"]]
+    return a
+
+
+def remote(script: str, stdin=None, timeout: float = 600, capture: bool = True) -> subprocess.CompletedProcess:
+    """원격 셸에 스크립트 하나를 보낸다. 인자는 모두 shlex.quote로 넣은 뒤에 부른다."""
+    return subprocess.run(ssh_argv() + [script], stdin=stdin, timeout=timeout,
+                          stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None)
+
+
+def need(pat: re.Pattern, value: str, what: str) -> str:
+    if not pat.fullmatch(value or "") or "/../" in f"{value}/" or "/./" in f"{value}/":
+        die("bad_argument", what)
+    return value
+
+
+# 접속 계정이 /data/workspace를 쓸 수 있게 한다(없으면 sudo로 만든다).
+WS_READY = 'sudo -n install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" /data/workspace'
+
+
+def op_info(_args: list[str]) -> int:
+    # 일반 VM에는 깨우기·쿨다운·실행 한도 개념이 없다. 닿으면 running, 못 닿으면 실패(원점은 unreachable로 본다).
+    try:
+        r = remote("true", timeout=60)
+    except subprocess.TimeoutExpired:
+        return 2
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr.decode("utf-8", "replace")[-300:])
+        return 2
+    print(json.dumps({"state": "running", "cooldown_s": 0, "run_left_min": None}))
+    return 0
+
+
+def op_put(args: list[str]) -> int:
+    src, dest = args[0], need(REMOTE_RE, args[1], "dest")
+    if not os.path.isdir(src):
+        die("bad_argument", "src")
+    tar = subprocess.Popen(["tar", "-C", src, "-cf", "-", "."], stdout=subprocess.PIPE)
+    q = shlex.quote(dest)
+    r = remote(f"set -e; {WS_READY}; mkdir -p {q}; tar -C {q} -xpf - --no-same-owner", stdin=tar.stdout, timeout=1800)
+    tar.stdout.close()
+    if tar.wait() != 0 or r.returncode != 0:
+        sys.stderr.write(r.stderr.decode("utf-8", "replace")[-300:])
+        return 1
+    return 0
+
+
+def op_exec(args: list[str]) -> int:
+    if args[:1] == ["--"]:
+        args = args[1:]
+    if not args:
+        die("bad_argument", "command")
+    os.execvp("ssh", ssh_argv() + [shlex.join(args)])
+    return 127
+
+
+def op_submit(args: list[str]) -> int:
+    name, timeout_s, script = need(NAME_RE, args[0], "name"), int(args[1]), args[2]
+    if timeout_s <= 0 or not os.path.isfile(script):
+        die("bad_argument", "submit")
+    q = shlex.quote(f"{QROOT}/{name}")
+    unit = shlex.quote(f"rtq-{name}")
+    # 감싸는 셸은 TERM을 잡아 두고(무시가 아니다: 자식은 기본 동작을 물려받아 job.sh가 자기 trap을 건다)
+    # job.sh가 끝나면 종료값을 rc에 원자적으로 남긴다. 취소·시간 초과(systemctl stop)도 job.sh가 마무리한다.
+    wrapper = shlex.quote('trap : TERM INT; bash "$0/job.sh" > "$0/log" 2>&1; echo $? > "$0/rc.tmp"; mv -f "$0/rc.tmp" "$0/rc"')
+    with open(script, "rb") as f:
+        r = remote(
+            f"set -e; {WS_READY}; mkdir -p {QROOT}; mkdir {q}; cat > {q}/job.sh; "
+            # 끝난 지 7일 넘은 잡 폴더는 지운다(잡 작업 영역은 rt-boxctl gc가 따로 지운다).
+            f"find {QROOT} -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec test -f {{}}/rc \\; -exec rm -rf {{}} + || true; "
+            f'sudo -n systemd-run --quiet --collect --uid="$(id -u)" --gid="$(id -g)" --unit={unit} '
+            f"-p RuntimeMaxSec={timeout_s} -p TimeoutStopSec=300 -p KillMode=control-group "
+            f'--setenv=HOME="$HOME" --working-directory=/data/workspace /bin/bash -c {wrapper} {q}',
+            stdin=f, timeout=300)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr.decode("utf-8", "replace")[-300:])
+        return 1
+    print(name)
+    return 0
+
+
+def status_of(qid: str) -> dict:
+    q = shlex.quote(f"{QROOT}/{need(NAME_RE, qid, 'qid')}")
+    r = remote(f'[ -d {q} ] || echo missing=1; [ -f {q}/rc ] && echo "rc=$(cat {q}/rc)"; [ -f {q}/cancelled ] && echo cancelled=1; '
+               f'echo "active=$(systemctl is-active {shlex.quote("rtq-" + qid)} 2>/dev/null)"', timeout=120)
+    if r.returncode != 0 and b"active=" not in r.stdout:
+        return {"state": "unknown", "exit": None}
+    kv = dict(line.split("=", 1) for line in r.stdout.decode("utf-8", "replace").splitlines() if "=" in line)
+    if kv.get("missing"):
+        return {"state": "unknown", "exit": None}
+    rc = kv.get("rc", "").strip() or None
+    if rc is not None:
+        return {"state": "cancelled" if kv.get("cancelled") else ("done" if rc == "0" else "failed"), "exit": rc}
+    if kv.get("active", "").strip() in ("active", "activating", "deactivating", "reloading"):
+        return {"state": "running", "exit": None}
+    # 유닛이 끝났는데 종료값이 없다: 감싸는 셸까지 강제로 죽었다(TimeoutStopSec 초과 등).
+    return {"state": "cancelled" if kv.get("cancelled") else "failed", "exit": None}
+
+
+def op_status(args: list[str]) -> int:
+    try:
+        print(json.dumps(status_of(args[0])))
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"state": "unknown", "exit": None}))
+    return 0
+
+
+def op_wait(args: list[str]) -> int:
+    while True:
+        try:
+            if status_of(args[0])["state"] in TERMINAL:
+                return 0
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(10)
+
+
+def op_cancel(args: list[str]) -> int:
+    qid = need(NAME_RE, args[0], "qid")
+    q = shlex.quote(f"{QROOT}/{qid}")
+    r = remote(f"[ -f {q}/rc ] || touch {q}/cancelled; sudo -n systemctl stop {shlex.quote('rtq-' + qid)} 2>&1; true", timeout=600)
+    # 유닛은 투입 즉시 시작하므로 "시작 전 취소"는 없다. 미시작·종료 증명은 rt-boxctl release-check가 맡는다.
+    print(json.dumps({"pending_cancelled": False, "detail": r.stdout.decode("utf-8", "replace")[-200:]}))
+    return 0
+
+
+def op_fetch(args: list[str]) -> int:
+    src, dest, max_bytes = need(REMOTE_RE, args[0], "src"), args[1], int(args[2])
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    p = subprocess.Popen(ssh_argv() + [f"tar -C {shlex.quote(src)} -cf - ."], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    total, ok = 0, True
+    try:
+        with tarfile.open(fileobj=p.stdout, mode="r|") as tf:
+            for m in tf:
+                rel = os.path.normpath(m.name)
+                if rel == ".":
+                    continue
+                if os.path.isabs(rel) or rel.split(os.sep)[0] == ".." or not (m.isfile() or m.isdir()):
+                    ok = False
+                    break
+                path = os.path.join(dest, rel)
+                if m.isdir():
+                    os.makedirs(path, mode=0o700, exist_ok=True)
+                    continue
+                total += m.size
+                if total > max_bytes:
+                    ok = False
+                    break
+                os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as out, tf.extractfile(m) as f:
+                    while chunk := f.read(1 << 20):
+                        out.write(chunk)
+        if ok:
+            # tar 끝 표식 뒤의 채움 블록까지 읽어야 ssh가 제대로 끝난다(남은 것을 끝까지 버리되 상한을 둔다).
+            rest = 0
+            while chunk := p.stdout.read(1 << 16):
+                rest += len(chunk)
+                if rest > 1 << 20:
+                    ok = False
+                    break
+    except (tarfile.TarError, OSError) as e:
+        sys.stderr.write(f"fetch_failed: {e}\n")
+        ok = False
+    finally:
+        if ok:
+            try:
+                p.wait(60)  # 출력은 다 읽었다. ssh가 끝날 때까지만 기다린다
+            except subprocess.TimeoutExpired:
+                ok = False
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+    return 0 if ok and p.returncode == 0 else 1
+
+
+def op_forward(args: list[str]) -> int:
+    lport, rport = int(args[0]), int(args[1])
+    os.execvp("ssh", ssh_argv(["-N", "-o", "ExitOnForwardFailure=yes", "-L", f"127.0.0.1:{lport}:127.0.0.1:{rport}"]))
+    return 127
+
+
+def op_pump_rw(_args: list[str]) -> int:
+    return 0  # ssh는 ~/.ssh를 읽기만 한다(known_hosts에 VM 호스트 키를 미리 넣어 둔다).
+
+
+OPS = {"info": (op_info, 0), "put": (op_put, 2), "exec": (op_exec, 1), "submit": (op_submit, 3), "status": (op_status, 1),
+       "wait": (op_wait, 1), "cancel": (op_cancel, 1), "fetch": (op_fetch, 3), "forward": (op_forward, 2), "pump-rw": (op_pump_rw, 0)}
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] not in OPS or len(argv) - 1 < OPS[argv[0]][1]:
+        die("usage", "rt-box-ssh " + "|".join(OPS))
+    fn = OPS[argv[0]][0]
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
