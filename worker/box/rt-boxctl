@@ -1,0 +1,635 @@
+#!/usr/bin/python3
+"""gjc-rt 박스 관리 도구. 박스 root 소유 /data/rt-ctl/bin/rt-boxctl, job.sh가 sudo로만 부른다.
+
+계약(계획 §19.2·§20~§24):
+- /data/rt-ctl/            root 0700. 이 도구, 잡별 표식·잠금. 러너(rtrun)는 읽지도 쓰지도 못한다.
+- /data/rt-pub/            root 0755. 러너가 읽고 실행하는 묶음(bundle/<판>/)과 gjc(gjc/<판>/gjc).
+- /data/workspace/rt/<job>/ root 0755. work/(rtrun 0700, 러너 작업 영역), out/(root 0755, instabox-q fetch용).
+- 러너는 전용 계정 rtrun(sudo·보조 그룹·linger 없음, nologin)으로 setpriv --no-new-privs 아래에서 돈다.
+- 신뢰하지 않는 데이터(work/ 아래)는 root가 직접 열지 않는다. 권한을 내린 자식이 읽어 파이프로 넘긴다(§17.1).
+- 시작: ctl 유닛(rt-<j>-g<gen>-ctl.service) 안의 start-inner가 잠금 안에서 봉인 없음 확인 → starting 표식
+  → 잠금 해제 → scope(rt-<j>-g<gen>.scope) 생성. scope 안 inscope가 봉인을 다시 본다.
+- 반납(release-check): 미시작 증명(sealed 있고 starting 없음) 또는 종료 증명(starting 있고 ctl·scope 모두
+  비었고 대기 작업 없음). 하나라도 확인하지 못하면 반납하지 않는다.
+출력은 한 줄 JSON. 오류는 {"error": code}와 종료코드 3.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+
+CTL = "/data/rt-ctl"
+PUB = "/data/rt-pub"
+WS = "/data/workspace/rt"
+INBOX = "/data/workspace/rt-in"
+# 잡 사이에 공유하는 빌드 캐시(신뢰 호스트 /srv/gjc-rt/cache와 같은 몫). 박스는 슬롯 1개라 target도 하나.
+CACHE = "/data/workspace/rt-cache"
+RUN_USER = "rtrun"
+JOB_RE = re.compile(r"rt-[0-9a-z]{26}")
+VER_RE = re.compile(r"[0-9a-f]{12}")
+GJC_VER_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}?(\.git)?")
+GJC_URL = "https://github.com/Yeachan-Heo/gajae-code/releases/download/v{ver}/gjc-linux-x64"
+DISK_MIN_BYTES = int(1.5 * (1 << 30))
+KEEP_DAYS = 7
+SCOPE_PROPS = ["-p", "MemoryMax=6G", "-p", "TasksMax=2048", "-p", "KillMode=control-group"]
+
+
+class BoxError(Exception):
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
+def out(obj) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def need(kind: str, value: str) -> str:
+    pat = {"job": JOB_RE, "ver": VER_RE, "gjc": GJC_VER_RE, "sha": SHA_RE, "url": URL_RE}[kind]
+    if not pat.fullmatch(value or ""):
+        raise BoxError("bad_argument", kind)
+    return value
+
+
+def need_gen(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", value or ""):
+        raise BoxError("bad_argument", "gen")
+    return int(value)
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_root(path: str, data: bytes, mode: int = 0o600) -> None:
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def unit_base(job: str, gen: int) -> str:
+    return f"rt-{job[3:]}-g{gen}"
+
+
+def ctl_dir(job: str) -> str:
+    return os.path.join(CTL, job)
+
+
+def marker(job: str, name: str) -> str:
+    return os.path.join(ctl_dir(job), name)
+
+
+def work_dir(job: str) -> str:
+    return os.path.join(WS, job, "work")
+
+
+def out_dir(job: str) -> str:
+    return os.path.join(WS, job, "out")
+
+
+class Lock:
+    """잡 잠금. 기다림은 timeout초까지만(§20.1 flock -w 30)."""
+
+    def __init__(self, job: str, timeout: float = 30.0):
+        self.path = marker(job, "lock")
+        self.timeout = timeout
+        self.fd = -1
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise BoxError("needs_reconcile", "lock_timeout")
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def run_uid() -> tuple[int, int]:
+    import pwd
+    p = pwd.getpwnam(RUN_USER)
+    return p.pw_uid, p.pw_gid
+
+
+def runner_env(job: str, ver: str | None = None) -> dict:
+    """신뢰 호스트 rt-helper의 러너 환경과 같게 맞춘다(git 설정은 묶음의 gitconfig만)."""
+    w = work_dir(job)
+    gen = 1
+    if ver is None:
+        try:
+            prep = json.loads(open(marker(job, "prepared"), encoding="utf-8").read())
+            ver, gen = prep["bundle"], int(prep["gen"])
+        except (OSError, ValueError, KeyError):
+            ver = None
+    env = {
+        "HOME": os.path.join(w, "home"), "XDG_CACHE_HOME": os.path.join(w, "cache"), "TMPDIR": os.path.join(w, "tmp"),
+        "GJC_CODING_AGENT_DIR": os.path.join(w, "agent"), "GJC_RT_JOB_DIR": w, "GJC_RT_JOB": f"{job}-g{gen}",
+        "LANG": "C.UTF-8", "PATH": "/usr/local/bin:/usr/bin:/bin", "CARGO_BUILD_JOBS": "4", "GIT_CONFIG_NOSYSTEM": "1",
+        "CARGO_HOME": os.path.join(CACHE, "cargo"), "CARGO_TARGET_DIR": os.path.join(CACHE, "target"),
+        "BUN_INSTALL_CACHE_DIR": os.path.join(CACHE, "bun"),
+    }
+    if ver:
+        env["GIT_CONFIG_GLOBAL"] = os.path.join(bundle_dir(ver), "gitconfig")
+    return env
+
+
+def as_runner(argv: list[str], job: str | None, ver: str | None = None, **kw) -> subprocess.CompletedProcess:
+    """rtrun으로 권한을 내려 실행한다. 환경은 우리가 정한 것만 넘긴다."""
+    env = runner_env(job, ver) if job else {"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    cmd = ["/usr/bin/setpriv", f"--reuid={RUN_USER}", f"--regid={RUN_USER}", "--clear-groups", "--no-new-privs",
+           "--reset-env", "--", "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()], *argv]
+    return subprocess.run(cmd, **kw)
+
+
+def bundle_dir(ver: str) -> str:
+    return os.path.join(PUB, "bundle", ver)
+
+
+# ---------------------------------------------------------------- setup
+
+def ensure_account() -> None:
+    import pwd
+    try:
+        pwd.getpwnam(RUN_USER)
+    except KeyError:
+        subprocess.run(["useradd", "--system", "--user-group", "--no-create-home", "--home-dir", "/nonexistent",
+                        "--shell", "/usr/sbin/nologin", RUN_USER], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["usermod", "-G", "", RUN_USER], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["loginctl", "disable-linger", RUN_USER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def ensure_dirs() -> None:
+    for path, mode in ((CTL, 0o700), (PUB, 0o755), (os.path.join(PUB, "bundle"), 0o755), (os.path.join(PUB, "gjc"), 0o755),
+                       (os.path.join(CTL, "tmp"), 0o700), (WS, 0o755)):
+        os.makedirs(path, exist_ok=True)
+        st = os.lstat(path)
+        if not os.path.isdir(path) or os.path.islink(path):
+            raise BoxError("setup_failed", path)
+        if st.st_uid != 0:
+            os.chown(path, 0, 0)
+        os.chmod(path, mode)
+    # instabox-q gc는 .keep 없는 /data/workspace/* 를 2일 뒤 지운다. 정리는 이 도구의 gc(7일)가 한다.
+    keep = os.path.join(WS, ".keep")
+    if not os.path.exists(keep):
+        write_root(keep, b"gjc-rt\n", 0o644)
+
+
+def install_bundle(src_tar: str, ver: str, tar_sha: str) -> None:
+    dest = bundle_dir(ver)
+    if os.path.isfile(os.path.join(dest, ".complete")):
+        return
+    tmp = os.path.join(CTL, "tmp", f"bundle-{ver}.tar")
+    # 업로드 영역(user 소유)에서 root 영역으로 먼저 옮긴 뒤 해시를 본다(검사와 사용 사이 교체 방지).
+    fd = os.open(src_tar, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as src, open(tmp, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    if sha256_file(tmp) != tar_sha:
+        os.unlink(tmp)
+        raise BoxError("bundle_hash_mismatch")
+    staging = dest + ".new"
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, mode=0o755)
+    with tarfile.open(tmp) as t:
+        for m in t.getmembers():
+            if not (m.isfile() or m.isdir()):
+                raise BoxError("bundle_invalid", "member type")
+        t.extractall(staging, filter="data")
+    os.unlink(tmp)
+    for root, dirs, files in os.walk(staging):
+        for n in dirs:
+            os.chmod(os.path.join(root, n), 0o755)
+        for n in files:
+            p = os.path.join(root, n)
+            os.chmod(p, 0o755 if os.access(p, os.X_OK) else 0o644)
+    os.chmod(staging, 0o755)
+    write_root(os.path.join(staging, ".complete"), b"ok\n", 0o644)
+    shutil.rmtree(dest, ignore_errors=True)
+    os.rename(staging, dest)
+
+
+def install_gjc(ver: str, sha: str) -> None:
+    d = os.path.join(PUB, "gjc", ver)
+    path = os.path.join(d, "gjc")
+    if os.path.isfile(path) and sha256_file(path) == sha:
+        return
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    os.chmod(d, 0o755)
+    tmp = os.path.join(CTL, "tmp", f"gjc-{ver}")
+    with urllib.request.urlopen(GJC_URL.format(ver=ver), timeout=300) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    if sha256_file(tmp) != sha:
+        os.unlink(tmp)
+        raise BoxError("gjc_hash_mismatch")
+    os.chmod(tmp, 0o755)
+    shutil.move(tmp, path)
+
+
+def v_setup(args: list[str]) -> None:
+    if len(args) != 5:
+        raise BoxError("bad_argument", "setup")
+    src_tar, ver, tar_sha, gjc_ver, gjc_sha = args
+    need("ver", ver); need("sha", tar_sha); need("gjc", gjc_ver); need("sha", gjc_sha)
+    ensure_dirs()
+    if shutil.disk_usage("/data").free < DISK_MIN_BYTES:
+        raise BoxError("disk_low")
+    ensure_account()
+    install_bundle(src_tar, ver, tar_sha)
+    install_gjc(gjc_ver, gjc_sha)
+    out({"ok": True, "bundle": ver, "gjc": gjc_ver, "disk_free_gb": round(shutil.disk_usage("/data").free / 1e9, 1)})
+
+
+# ---------------------------------------------------------------- prepare
+
+def v_prepare(args: list[str]) -> None:
+    """업로드 영역의 manifest·미push bundle로 잡 작업 영역을 만든다. 저장소 일은 모두 rtrun이 한다."""
+    if len(args) != 4:
+        raise BoxError("bad_argument", "prepare")
+    job, gen, src, ver = need("job", args[0]), need_gen(args[1]), args[2], need("ver", args[3])
+    if os.path.realpath(src) != os.path.join(INBOX, job):
+        raise BoxError("bad_argument", "src")
+    os.makedirs(ctl_dir(job), mode=0o700, exist_ok=True)
+    if os.path.exists(marker(job, "cleaned")):
+        raise BoxError("job_cleaned")
+    with Lock(job):
+        if os.path.exists(marker(job, f"sealed-g{gen}")):
+            raise BoxError("generation_sealed")
+    uid, gid = run_uid()
+    jd = os.path.join(WS, job)
+    os.makedirs(jd, mode=0o755, exist_ok=True)
+    w = work_dir(job)
+    if os.path.exists(w):
+        raise BoxError("already_prepared")
+    os.mkdir(w, 0o700)
+    os.chown(w, uid, gid)
+    os.makedirs(out_dir(job), mode=0o755, exist_ok=True)
+    for sub in ("home", "cache", "tmp"):
+        as_runner(["/usr/bin/mkdir", "-p", "-m", "0700", os.path.join(w, sub)], job, ver, check=True)
+    if not os.path.isdir(CACHE):
+        os.mkdir(CACHE, 0o700)
+        os.chown(CACHE, uid, gid)
+    for sub in ("cargo", "target", "bun"):
+        as_runner(["/usr/bin/mkdir", "-p", "-m", "0700", os.path.join(CACHE, sub)], job, ver, check=True)
+    # manifest는 root가 업로드 영역에서 O_NOFOLLOW로 읽는다(크기 상한). 내용 검증은 아래 형식 검사.
+    fd = os.open(os.path.join(src, "manifest.json"), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(512 * 1024 + 1)
+    if len(raw) > 512 * 1024:
+        raise BoxError("manifest_too_large")
+    manifest = json.loads(raw)
+    if manifest.get("job") != job or manifest.get("gen") != gen:
+        raise BoxError("manifest_mismatch")
+    url = need("url", manifest["public_url"])
+    pub = str(manifest.get("public_sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", pub):
+        raise BoxError("bad_argument", "public_sha")
+    wt = os.path.join(bundle_dir(ver), "rt-worktool.py")
+    # 공개 원본을 익명으로 받는다(자격증명 없음, file 프로토콜 금지).
+    r = as_runner(["/usr/bin/git", "-c", "protocol.file.allow=never", "-c", "credential.helper=", "clone", "--bare", "-q",
+                   "--no-tags", url, os.path.join(w, "cache.git")], job, ver, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                  timeout=1800)
+    if r.returncode != 0:
+        raise BoxError("public_clone_failed", r.stderr.decode("utf-8", "replace")[-300:])
+    c = as_runner(["/usr/bin/git", "--git-dir", os.path.join(w, "cache.git"), "cat-file", "-e", f"{pub}^{{commit}}"], job, ver,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if c.returncode != 0:
+        raise BoxError("public_base_missing")
+    bpath = os.path.join(src, "base.bundle")
+    if os.path.exists(bpath):
+        fd = os.open(bpath, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as f:
+            r = as_runner(["/usr/bin/python3", wt, "write-base", job], job, ver, stdin=f, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=1800)
+        if r.returncode != 0:
+            raise BoxError("bundle_invalid", r.stderr.decode("utf-8", "replace")[-300:])
+    r = as_runner(["/usr/bin/python3", wt, "prepare", job], job, ver, input=json.dumps(manifest).encode(),
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        try:
+            code = json.loads(err[-1]).get("error", "prepare_failed")
+        except (ValueError, IndexError):
+            code = "prepare_failed"
+        raise BoxError(code)
+    write_root(marker(job, "prepared"), json.dumps({"gen": gen, "bundle": ver}).encode())
+    shutil.rmtree(src, ignore_errors=True)
+    out({"ok": True, "job": job, "gen": gen})
+
+
+# ---------------------------------------------------------------- 시작
+
+def v_start_inner(args: list[str]) -> None:
+    """ctl 유닛의 주 프로세스. 봉인 확인과 starting 표식은 잠금 안, scope 생성은 잠금 밖(§20.4·§22.3)."""
+    job, gen = need("job", args[0]), need_gen(args[1])
+    with Lock(job):
+        if os.path.exists(marker(job, f"sealed-g{gen}")):
+            out({"ok": False, "sealed": True})
+            sys.exit(3)
+        write_root(marker(job, f"starting-g{gen}"), str(time.time()).encode())
+    if os.environ.get("RT_TEST_PAUSE_AFTER_STARTING"):
+        # 반납 시험(§21.2): starting 기록 직후 SIGSTOP을 걸 틈.
+        time.sleep(float(os.environ["RT_TEST_PAUSE_AFTER_STARTING"]))
+    r = subprocess.run(["systemd-run", "--scope", "--collect", "--quiet", f"--unit={unit_base(job, gen)}", *SCOPE_PROPS,
+                        "--", sys.executable, os.path.abspath(__file__), "inscope", job, str(gen)])
+    write_root(marker(job, f"start-exited-g{gen}"), str(r.returncode).encode())
+    if os.environ.get("RT_TEST_PAUSE_BEFORE_SCOPE_STOP"):
+        time.sleep(float(os.environ["RT_TEST_PAUSE_BEFORE_SCOPE_STOP"]))
+    # 러너가 끝나도 떼어 낸 자손(setsid·nohup)이 scope에 남을 수 있다. 정상 종료에서도 scope를 멈춘다(§19.2).
+    subprocess.run(["systemctl", "stop", f"{unit_base(job, gen)}.scope"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=120)
+    out({"ok": True, "exit": r.returncode})
+
+
+def v_inscope(args: list[str]) -> None:
+    """scope 안 첫 단계(root): 봉인을 다시 보고 러너를 rtrun으로 실행한다(§21.2)."""
+    job, gen = need("job", args[0]), need_gen(args[1])
+    if os.path.exists(marker(job, f"sealed-g{gen}")):
+        sys.exit(3)
+    prep = json.loads(open(marker(job, "prepared"), encoding="utf-8").read())
+    runner = os.path.join(bundle_dir(prep["bundle"]), "rt-runner.py")
+    env = runner_env(job)
+    argv = ["/usr/bin/setpriv", f"--reuid={RUN_USER}", f"--regid={RUN_USER}", "--clear-groups", "--no-new-privs",
+            "--reset-env", "--", "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
+            "/usr/bin/python3", runner, job, str(gen)]
+    os.chdir("/")
+    os.execv(argv[0], argv)
+
+
+# ---------------------------------------------------------------- 상태·취소·반납
+
+def unit_info(unit: str) -> dict:
+    p = subprocess.run(["systemctl", "show", unit, "-p", "LoadState,ActiveState,ControlGroup"], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, timeout=30)
+    if p.returncode != 0:
+        raise BoxError("needs_reconcile", "systemctl_show")
+    info = dict(line.split("=", 1) for line in p.stdout.decode().splitlines() if "=" in line)
+    cg = info.get("ControlGroup", "")
+    populated = None
+    if cg:
+        try:
+            with open(f"/sys/fs/cgroup{cg}/cgroup.events", encoding="utf-8") as f:
+                ev = dict(line.split() for line in f if line.strip())
+            populated = ev.get("populated") == "1"
+        except OSError:
+            populated = None
+    info["populated"] = populated
+    return info
+
+
+def unit_empty(info: dict) -> bool:
+    """실행 그룹이 비었는지(§23.2·§24 A11-01). 유닛 상태 이름은 증거가 아니다."""
+    if info.get("LoadState") == "not-found":
+        return True
+    if info.get("ControlGroup"):
+        return info["populated"] is False
+    # cgroup이 없으면 프로세스도 없다. 단 상태가 active/activating이면 판단하지 않는다.
+    return info.get("ActiveState") in ("inactive", "failed")
+
+
+def pending_jobs(units: list[str]) -> bool:
+    p = subprocess.run(["systemctl", "list-jobs", "--no-legend", "--no-pager"], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, timeout=30)
+    if p.returncode != 0:
+        raise BoxError("needs_reconcile", "list_jobs")
+    text = p.stdout.decode()
+    return any(u in text for u in units)
+
+
+def release_state(job: str, gen: int) -> dict:
+    if not os.path.isdir(ctl_dir(job)):
+        return {"release": False, "reason": "evidence_missing"}
+    base = unit_base(job, gen)
+    ctl_u, scope_u = f"{base}-ctl.service", f"{base}.scope"
+    sealed = os.path.exists(marker(job, f"sealed-g{gen}"))
+    starting = os.path.exists(marker(job, f"starting-g{gen}"))
+    ctl_i, scope_i = unit_info(ctl_u), unit_info(scope_u)
+    units = {"ctl": {k: ctl_i.get(k) for k in ("LoadState", "ActiveState", "populated")},
+             "scope": {k: scope_i.get(k) for k in ("LoadState", "ActiveState", "populated")}}
+    if sealed and not starting:
+        # 미시작 증명(조건 1). 잠금 안에서 둘 중 하나만 먼저 쓰일 수 있다. 다만 실행 그룹이 남아 있으면
+        # 표식이 사라진 것(증거 유실)이므로 반납하지 않는다.
+        if not (unit_empty(ctl_i) and unit_empty(scope_i)) or pending_jobs([ctl_u, scope_u]):
+            return {"release": False, "reason": "needs_reconcile", "units": units}
+        return {"release": True, "proof": "not_started", "units": units}
+    if starting:
+        empty = unit_empty(ctl_i) and unit_empty(scope_i)
+        if empty and not pending_jobs([ctl_u, scope_u]):
+            return {"release": True, "proof": "ended", "units": units,
+                    "start_exited": os.path.exists(marker(job, f"start-exited-g{gen}"))}
+        return {"release": False, "reason": "running", "units": units}
+    return {"release": False, "reason": "no_start_evidence", "units": units}
+
+
+def v_release_check(args: list[str]) -> None:
+    job, gen = need("job", args[0]), need_gen(args[1])
+    out(release_state(job, gen))
+
+
+def seal(job: str, gen: int) -> None:
+    os.makedirs(ctl_dir(job), mode=0o700, exist_ok=True)
+    with Lock(job, 30.0):
+        write_root(marker(job, f"sealed-g{gen}"), str(time.time()).encode())
+
+
+def v_seal(args: list[str]) -> None:
+    job, gen = need("job", args[0]), need_gen(args[1])
+    seal(job, gen)
+    out({"ok": True, "sealed": True})
+
+
+def v_cancel(args: list[str]) -> None:
+    """봉인 → scope·ctl 정리 → 반납 판정. 잠금을 못 잡으면 needs_reconcile(예약 유지)."""
+    job, gen = need("job", args[0]), need_gen(args[1])
+    seal(job, gen)
+    base = unit_base(job, gen)
+    scope_u, ctl_u = f"{base}.scope", f"{base}-ctl.service"
+    if not unit_empty(unit_info(scope_u)):
+        subprocess.run(["systemctl", "kill", "--signal=TERM", scope_u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not unit_empty(unit_info(scope_u)):
+            time.sleep(1)
+    subprocess.run(["systemctl", "stop", scope_u, ctl_u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    out({"ok": True, "sealed": True, **release_state(job, gen)})
+
+
+def v_status(args: list[str]) -> None:
+    job, gen = need("job", args[0]), need_gen(args[1])
+    marks = sorted(os.listdir(ctl_dir(job))) if os.path.isdir(ctl_dir(job)) else []
+    res: dict = {"markers": [m for m in marks if m != "lock"], **release_state(job, gen)}
+    try:
+        with open(os.path.join(out_dir(job), "collect.json"), encoding="utf-8") as f:
+            res["collect"] = json.load(f)
+    except (OSError, ValueError):
+        res["collect"] = None
+    out(res)
+
+
+# ---------------------------------------------------------------- 결과 꺼내기·정리
+
+def stream_from_runner(argv: list[str], job: str, dest: str, limit: int, timeout: float = 1800) -> tuple[int, str]:
+    """rtrun 자식의 stdout을 root 소유 dest에 상한까지 쓴다."""
+    tmp = dest + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    total = 0
+    with os.fdopen(fd, "wb") as f:
+        env = runner_env(job)
+        cmd = ["/usr/bin/setpriv", f"--reuid={RUN_USER}", f"--regid={RUN_USER}", "--clear-groups", "--no-new-privs",
+               "--reset-env", "--", "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()], *argv]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        while True:
+            chunk = p.stdout.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                p.kill()
+                p.wait()
+                os.unlink(tmp)
+                return 1, "too_large"
+            f.write(chunk)
+        err = p.stderr.read().decode("utf-8", "replace")
+        code = p.wait(timeout=timeout)
+    if code != 0:
+        os.unlink(tmp)
+        try:
+            return code, json.loads(err.strip().splitlines()[-1]).get("error", "failed")
+        except (ValueError, IndexError):
+            return code, "failed"
+    os.replace(tmp, dest)
+    return 0, "ok"
+
+
+def v_collect_prep(args: list[str]) -> None:
+    """종료(또는 취소) 뒤 결과를 root 소유 out/에 모은다. 러너가 마무리를 못 했으면 rtrun으로 finish를 돌린다."""
+    job = need("job", args[0])
+    prep = json.loads(open(marker(job, "prepared"), encoding="utf-8").read())
+    bd = bundle_dir(prep["bundle"])
+    wt = os.path.join(bd, "rt-worktool.py")
+    o = out_dir(job)
+    os.makedirs(o, mode=0o755, exist_ok=True)
+    st = as_runner(["/usr/bin/python3", wt, "status", job], job, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                   timeout=300)
+    try:
+        done = json.loads(st.stdout.decode().strip().splitlines()[-1]).get("done")
+    except (ValueError, IndexError):
+        done = None
+    if not done:
+        as_runner(["/usr/bin/python3", wt, "finish", job, args[1] if len(args) > 1 else "cancelled"], job,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+    res: dict = {}
+    code, why = stream_from_runner(["/usr/bin/python3", wt, "bundle", job], job, os.path.join(o, "out.bundle"), 512 << 20)
+    res["bundle"] = "ok" if code == 0 else why
+    code, why = stream_from_runner(["/usr/bin/python3", wt, "logs", job], job, os.path.join(o, "logs.tar"), 64 << 20)
+    res["logs"] = "ok" if code == 0 else why
+    code, why = stream_from_runner(["/usr/bin/cat", os.path.join(work_dir(job), "events.jsonl")], job,
+                                   os.path.join(o, "events.jsonl"), 50 << 20)
+    res["events"] = "ok" if code == 0 else why
+    for name in ("out.bundle", "logs.tar", "events.jsonl"):
+        p = os.path.join(o, name)
+        if os.path.exists(p):
+            res[f"{name}.sha256"] = sha256_file(p)
+    write_root(os.path.join(o, "collect.json"), json.dumps(res).encode(), 0o644)
+    out({"ok": True, **res})
+
+
+def v_cleanup(args: list[str]) -> None:
+    job, gen = need("job", args[0]), need_gen(args[1])
+    if os.path.exists(marker(job, "cleaned")):
+        out({"ok": True, "already": True})
+        return
+    rs = release_state(job, gen)
+    if not rs["release"] and rs.get("reason") != "evidence_missing":
+        raise BoxError("job_running", rs.get("reason", ""))
+    shutil.rmtree(os.path.join(WS, job), ignore_errors=True)
+    shutil.rmtree(os.path.join(INBOX, job), ignore_errors=True)
+    if os.path.exists(os.path.join(WS, job)):
+        raise BoxError("cleanup_failed")
+    if os.path.isdir(ctl_dir(job)):
+        for name in os.listdir(ctl_dir(job)):
+            if name != "lock":
+                os.unlink(marker(job, name))
+    else:
+        os.makedirs(ctl_dir(job), mode=0o700)
+    write_root(marker(job, "cleaned"), str(time.time()).encode())
+    out({"ok": True})
+
+
+def v_gc(args: list[str]) -> None:
+    """7일 지난 rt 잡 디렉터리를 지운다(반납 증명이 있는 것만). 업로드 찌꺼기는 2일."""
+    now = time.time()
+    removed = []
+    for name in sorted(os.listdir(WS)) if os.path.isdir(WS) else []:
+        if not JOB_RE.fullmatch(name):
+            continue
+        p = os.path.join(WS, name)
+        if now - os.lstat(p).st_mtime < KEEP_DAYS * 86400:
+            continue
+        prep = marker(name, "prepared")
+        gen = json.loads(open(prep, encoding="utf-8").read())["gen"] if os.path.exists(prep) else 1
+        if release_state(name, gen)["release"] or not os.path.isdir(ctl_dir(name)):
+            shutil.rmtree(p, ignore_errors=True)
+            removed.append(name)
+    for name in sorted(os.listdir(INBOX)) if os.path.isdir(INBOX) else []:
+        p = os.path.join(INBOX, name)
+        if JOB_RE.fullmatch(name) and now - os.lstat(p).st_mtime > 2 * 86400:
+            shutil.rmtree(p, ignore_errors=True)
+    # 정리가 끝난 잡의 표식(cleaned·lock)은 늦은 재실행을 막으려고 남긴다. 보관 기간이 지나면 지운다.
+    for name in sorted(os.listdir(CTL)) if os.path.isdir(CTL) else []:
+        c = marker(name, "cleaned") if JOB_RE.fullmatch(name) else ""
+        if c and os.path.exists(c) and now - os.lstat(c).st_mtime > KEEP_DAYS * 86400:
+            shutil.rmtree(ctl_dir(name), ignore_errors=True)
+    out({"ok": True, "removed": removed})
+
+
+VERBS = {"setup": v_setup, "prepare": v_prepare, "start-inner": v_start_inner, "inscope": v_inscope,
+         "release-check": v_release_check, "seal": v_seal, "cancel": v_cancel, "status": v_status, "collect-prep": v_collect_prep,
+         "cleanup": v_cleanup, "gc": v_gc}
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        out({"error": "not_root"})
+        return 3
+    os.umask(0o022)
+    if len(argv) < 2 or argv[1] not in VERBS:
+        out({"error": "bad_verb"})
+        return 3
+    try:
+        VERBS[argv[1]](argv[2:])
+        return 0
+    except BoxError as exc:
+        out({"error": exc.code, "detail": exc.detail[:300]})
+        return 3
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        out({"error": "boxctl_failed", "detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

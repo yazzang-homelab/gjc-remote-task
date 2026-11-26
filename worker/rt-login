@@ -1,0 +1,13 @@
+#!/usr/bin/python3
+"""gjcrt-ctl 로그인 셸. -c 인자 전체가 dispatcher 고정 경로와 같을 때만 넘긴다(§18.2)."""
+import os
+import re
+import sys
+
+PATTERN = re.compile(r"^/usr/local/lib/gjc-rt/rt-dispatch --origin ([a-z][a-z0-9-]{0,31})$")
+if len(sys.argv) == 3 and sys.argv[1] == "-c":
+    m = PATTERN.match(sys.argv[2])
+    if m:
+        os.execv("/usr/local/lib/gjc-rt/rt-dispatch", ["rt-dispatch", "--origin", m.group(1)])
+sys.stderr.write("gjc-rt: shell access denied\n")
+sys.exit(64)

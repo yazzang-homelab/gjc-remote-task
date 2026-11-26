@@ -1,0 +1,949 @@
+#!/usr/bin/python3
+"""gjc-rt root helper. 진입 계정 gjcrt-ctl이 sudo로만 부른다(계획 §16.1).
+
+원칙
+- 호출자를 믿지 않는다. 모든 인자는 정규식으로 검사하고, 경로는 job_id에서만 만든다.
+- root가 직접 여닫는 것은 root 소유 경로뿐이다. 잡 작업 디렉터리는 setpriv로 권한을 내린
+  rt-worktool이 다룬다(§17.1, §18.1).
+- 인증: reserve·install-gjc는 호스트 등록 토큰, 나머지는 잡 cap 토큰(HMAC). 토큰은 stdin 첫 줄로만 받는다.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+LIB = "/usr/local/lib/gjc-rt"
+ETC = "/etc/gjc-rt"
+PRIV = "/etc/gjc-rt/private"
+STATE = "/var/lib/gjc-rt"
+WORK = "/srv/gjc-rt/work"
+REPOS = "/srv/gjc-rt/repos"
+SHARED_CACHE = "/srv/gjc-rt/cache"
+KEY_FILE = "/var/lib/gjc-rt/keys/gjc-rt.key"
+RUN_USER = "gjcrt"
+PROTO = 1
+
+RX = {
+    "origin": re.compile(r"^[a-z][a-z0-9-]{0,31}$"),
+    "job": re.compile(r"^rt-[0-9a-z]{26}$"),
+    "gen": re.compile(r"^[0-9]{1,6}$"),
+    "seq": re.compile(r"^[0-9]{1,12}$"),
+    "num": re.compile(r"^[0-9]{1,6}$"),
+    "version": re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$"),
+    "sha256": re.compile(r"^[0-9a-f]{64}$"),
+    "model": re.compile(r"^[A-Za-z0-9._:/@+-]{1,120}$"),
+    "session": re.compile(r"^[A-Za-z0-9-]{8,64}$"),
+    "msgid": re.compile(r"^msg-[0-9a-z]{10,40}$"),
+    "replyto": re.compile(r"^(-|q-[0-9a-z-]{3,40})$"),
+    "repo": re.compile(r"^[0-9a-f]{16,64}$"),
+}
+
+
+class HelperError(Exception):
+    def __init__(self, code: str, detail: str = "", status: int = 2):
+        super().__init__(code)
+        self.code, self.detail, self.status = code, detail, status
+
+
+def need(kind: str, value: str) -> str:
+    if not isinstance(value, str) or not RX[kind].match(value):
+        raise HelperError("bad_argument", kind, 64)
+    return value
+
+
+def emit(obj) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def now() -> float:
+    return time.time()
+
+
+def iso(t: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t if t is not None else now()))
+
+
+# ---------------------------------------------------------------- 설정·파일
+
+def load_config() -> dict:
+    with open(os.path.join(ETC, "config.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("max_slots", 2)
+    cfg.setdefault("load_max", 0.7)
+    cfg.setdefault("disk_min_gb", 5)
+    cfg.setdefault("job_memory_max", "8G")
+    cfg.setdefault("job_tasks_max", 2048)
+    cfg.setdefault("cargo_jobs", 4)
+    cfg.setdefault("psi_cpu_max", 20.0)
+    cfg.setdefault("psi_mem_max", 10.0)
+    cfg.setdefault("contention_slice", None)
+    cfg.setdefault("contention_psi_max", 10.0)
+    cfg.setdefault("allowed_models", [])
+    cfg.setdefault("lease_s", 900)
+    return cfg
+
+
+def read_root_file(path: str) -> str:
+    st = os.lstat(path)
+    if st.st_uid != 0 or not os.path.isfile(path) or os.path.islink(path):
+        raise HelperError("config_untrusted", os.path.basename(path))
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def job_state_dir(job: str) -> str:
+    return os.path.join(STATE, "jobs", need("job", job))
+
+
+def ensure_root_dir(path: str, mode: int = 0o700) -> None:
+    os.makedirs(path, mode=mode, exist_ok=True)
+    st = os.lstat(path)
+    if st.st_uid != 0 or not os.path.isdir(path) or os.path.islink(path):
+        raise HelperError("state_untrusted", path)
+
+
+def write_root_json(path: str, obj) -> None:
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_root_json(path: str, default=None):
+    try:
+        return json.loads(read_root_file(path))
+    except FileNotFoundError:
+        return default
+
+
+class Flock:
+    def __init__(self, path: str):
+        self.path = path
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------- 인증
+
+def read_auth_line() -> list[str]:
+    # fd에서 한 바이트씩 읽는다. 버퍼 독자를 쓰면 뒤 본문을 미리 삼켜, fd를 넘겨받은 하위 프로세스가 앞부분을 잃는다.
+    line = b""
+    while not line.endswith(b"\n") and len(line) < 512:
+        ch = os.read(0, 1)
+        if not ch:
+            break
+        line += ch
+    return line.decode("ascii", "replace").strip().split(" ")
+
+
+def check_reg(origin: str) -> None:
+    parts = read_auth_line()
+    path = os.path.join(PRIV, "hosts", f"{origin}.token")
+    token = read_root_file(path).strip() if os.path.lexists(path) else ""
+    if not token or len(parts) != 2 or parts[0] != "reg" or not hmac.compare_digest(parts[1], token):
+        raise HelperError("unauthorized", "reg", 77)
+
+
+def cap_token(origin: str, session: str, job: str, gen: int) -> str:
+    key = read_root_file(os.path.join(PRIV, "cap.key")).strip().encode()
+    return hmac.new(key, f"{origin}|{session}|{job}|{gen}".encode(), hashlib.sha256).hexdigest()
+
+
+def check_cap(origin: str, job: str) -> dict:
+    parts = read_auth_line()
+    meta = read_root_json(os.path.join(job_state_dir(job), "meta.json"))
+    if meta is None:
+        raise HelperError("job_unknown", status=3)
+    if len(parts) != 3 or parts[0] != "cap" or parts[1] != meta["main_session"] or meta["origin"] != origin:
+        raise HelperError("unauthorized", "cap", 77)
+    expected = cap_token(origin, meta["main_session"], job, meta["gen"])
+    if not hmac.compare_digest(parts[2], expected):
+        raise HelperError("unauthorized", "cap", 77)
+    return meta
+
+
+# ---------------------------------------------------------------- 권한을 내린 실행
+
+def run_user():
+    return pwd.getpwnam(RUN_USER)
+
+
+def worktool(args: list[str], job: str | None, stdin=None, stdout=subprocess.PIPE, timeout: float | None = 600,
+             bundle_version: str | None = None, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    cfg = load_config()
+    ver = bundle_version or cfg["bundle_version"]
+    home = os.path.join(WORK, job, "home") if job else "/nonexistent"
+    cmd = ["/usr/bin/setpriv", f"--reuid={RUN_USER}", f"--regid={RUN_USER}", "--init-groups", "--no-new-privs",
+           "--reset-env", "/usr/bin/env", f"HOME={home}", "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8",
+           "/usr/bin/python3", os.path.join(LIB, "bundle", ver, "rt-worktool.py"), *args]
+    if input_bytes is not None:
+        return subprocess.run(cmd, input=input_bytes, stdout=stdout, stderr=subprocess.PIPE, timeout=timeout, cwd="/")
+    return subprocess.run(cmd, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, timeout=timeout, cwd="/")
+
+
+def worktool_json(args: list[str], job: str | None, **kw) -> dict:
+    proc = worktool(args, job, **kw)
+    if proc.returncode != 0:
+        try:
+            err = json.loads(proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            err = {"error": "worktool_failed"}
+        raise HelperError(err.get("error", "worktool_failed"), err.get("detail", ""), 3)
+    return json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+
+
+def worktool_input(args: list[str], job: str, data: bytes, bundle_version: str, timeout: float = 1800) -> dict:
+    """stdin으로 자료를 넘기고 JSON 한 줄을 받는다."""
+    proc = worktool(args, job, stdin=None, timeout=timeout, bundle_version=bundle_version, input_bytes=data)
+    if proc.returncode != 0:
+        try:
+            err = json.loads(proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            err = {"error": "worktool_failed"}
+        raise HelperError(err.get("error", "worktool_failed"), err.get("detail", ""), 3)
+    return json.loads(proc.stdout.decode("utf-8").strip().splitlines()[-1])
+
+
+def worktool_stream(args: list[str], job: str, bundle_version: str) -> None:
+    """작업 도구의 stdout 바이트를 그대로 중계한다(root는 경로를 열지 않는다)."""
+    proc = worktool(args, job, stdout=sys.stdout.buffer, timeout=1800, bundle_version=bundle_version)
+    if proc.returncode != 0:
+        try:
+            err = json.loads(proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            err = {"error": "worktool_failed"}
+        sys.stderr.write(json.dumps(err) + "\n")
+        raise SystemExit(3)
+
+
+# ---------------------------------------------------------------- 시스템 사실
+
+def load_snapshot() -> dict:
+    load1 = float(open("/proc/loadavg").read().split()[0])
+    ncpu = os.cpu_count() or 1
+    mem = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":", 1)
+        mem[k] = int(v.split()[0])
+    disk = shutil.disk_usage("/srv")
+
+    def psi(path: str) -> float | None:
+        # some avg60(계획 §15.5 중단 기준). avg10은 순간 변동이 커서 쓰지 않는다.
+        try:
+            for line in open(path):
+                if line.startswith("some"):
+                    return float(line.split()[2].split("=")[1])
+        except OSError:
+            return None
+        return None
+
+    cfg = load_config()
+    snap = {"load1": load1, "ncpu": ncpu, "load_ratio": round(load1 / ncpu, 3),
+            "mem_avail_ratio": round(mem.get("MemAvailable", 0) / max(1, mem.get("MemTotal", 1)), 3),
+            "disk_free_gb": round(disk.free / 1e9, 1), "psi_cpu": psi("/proc/pressure/cpu"),
+            "psi_mem": psi("/proc/pressure/memory")}
+    if cfg.get("contention_slice"):
+        snap["contention_psi"] = psi(f"/sys/fs/cgroup/{cfg['contention_slice']}/cpu.pressure")
+    return snap
+
+
+def boot_id() -> str:
+    return open("/proc/sys/kernel/random/boot_id").read().strip()
+
+
+def unit_name(job: str, gen: int) -> str:
+    return f"rt-{job[3:]}-g{gen}.service"
+
+
+def unit_show(unit: str) -> dict:
+    proc = subprocess.run(["systemctl", "show", unit, "-p", "LoadState,ActiveState,SubState,InvocationID,Result,ExecMainStatus"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+    out = {}
+    for line in proc.stdout.decode().splitlines():
+        k, _, v = line.partition("=")
+        out[k] = v
+    return out
+
+
+def installed_gjc() -> list[str]:
+    base = os.path.join(LIB, "gjc")
+    try:
+        return sorted(v for v in os.listdir(base) if RX["version"].match(v))
+    except FileNotFoundError:
+        return []
+
+
+def trusted_gjc() -> dict:
+    table = {}
+    for line in read_root_file(os.path.join(ETC, "trusted-gjc.sha256")).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and RX["version"].match(parts[0]) and RX["sha256"].match(parts[1]):
+            table[parts[0]] = parts[1]
+    return table
+
+
+def gjc_binary_ok(version: str) -> bool:
+    path = os.path.join(LIB, "gjc", version, "gjc")
+    want = trusted_gjc().get(version)
+    if not want or not os.path.isfile(path):
+        return False
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest() == want
+
+
+def normalize_model(sel: str) -> str:
+    return sel.split(":", 1)[0].lower()
+
+
+def hub_models(cfg: dict) -> tuple[list[str] | None, str | None]:
+    """전용 키로 허브 /v1/models를 본다(10분 캐시). 실패하면 (None, 사유)."""
+    cache_path = os.path.join(STATE, "models-cache.json")
+    cache = read_root_json(cache_path, {}) or {}
+    if cache.get("at", 0) > now() - 600 and isinstance(cache.get("ids"), list):
+        return cache["ids"], None
+    if not os.path.exists(KEY_FILE):
+        return None, "credential_missing"
+    key = read_root_file(KEY_FILE).strip()
+    req = urllib.request.Request(cfg["hub_models_url"], headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read(4 << 20))
+    except Exception as exc:  # noqa: BLE001 - 원인 종류만 보고
+        return None, f"probe_failed:{type(exc).__name__}"
+    ids = sorted({str(m.get("id", "")).lower() for m in data.get("data", []) if isinstance(m, dict)})
+    write_root_json(cache_path, {"at": now(), "ids": ids})
+    return ids, None
+
+
+def model_check(cfg: dict, sel: str) -> str | None:
+    norm = normalize_model(sel)
+    allowed = [normalize_model(m) for m in cfg["allowed_models"]]
+    if norm not in allowed:
+        return "model_not_allowed"
+    ids, err = hub_models(cfg)
+    if err:
+        return err
+    provider_prefix = cfg["provider"] + "/"
+    bare = norm[len(provider_prefix):] if norm.startswith(provider_prefix) else norm
+    if bare not in ids and norm not in ids:
+        return "model_unavailable"
+    return None
+
+
+# ---------------------------------------------------------------- 슬롯 원장 (§15.2, §16.3)
+
+SLOTS = os.path.join(STATE, "slots.json")
+SLOTS_LOCK = os.path.join(STATE, "slots.lock")
+
+
+def slots_load() -> list[dict]:
+    return (read_root_json(SLOTS, {"slots": []}) or {"slots": []})["slots"]
+
+
+def slots_save(slots: list[dict]) -> None:
+    write_root_json(SLOTS, {"slots": slots})
+
+
+def ended_marker(job: str, gen: int) -> str:
+    return os.path.join(job_state_dir(job), f"ended-g{gen}.json")
+
+
+def seal(job: str, gen: int, reason: str) -> None:
+    path = os.path.join(job_state_dir(job), f"sealed-g{gen}")
+    if not os.path.exists(path):
+        write_root_json(path, {"at": iso(), "reason": reason})
+
+
+def meta_update(job: str, **fields) -> None:
+    path = os.path.join(job_state_dir(job), "meta.json")
+    meta = read_root_json(path)
+    if meta is None:
+        return
+    meta.update(fields)
+    write_root_json(path, meta)
+
+
+def reclaim(slots: list[dict]) -> list[dict]:
+    """증거가 있을 때만 슬롯을 회수한다. 자동 재시작은 없다(P-5)."""
+    keep = []
+    t = now()
+    bid = boot_id()
+    for s in slots:
+        job, gen = s["job"], s["gen"]
+        if os.path.exists(ended_marker(job, gen)):
+            continue  # ending + ended 표식 → 반납
+        if s["state"] in ("reserved", "staged"):
+            unit = unit_show(unit_name(job, gen))
+            if unit.get("LoadState") == "loaded" and unit.get("InvocationID"):
+                # 유닛 생성 뒤 기록 전에 끊긴 경우를 먼저 채운다(§16.3).
+                s.update(state="launched", invocation=unit["InvocationID"], boot_id=bid)
+                keep.append(s)
+                continue
+            if s["lease_until"] < t:
+                seal(job, gen, "lease_expired")
+                meta_update(job, state="failed", failure="lease_expired")
+                continue
+            keep.append(s)
+            continue
+        if s["state"] == "launched":
+            unit = unit_show(unit_name(job, gen))
+            gone = unit.get("LoadState") == "not-found" or unit.get("InvocationID") != s.get("invocation") \
+                or s.get("boot_id") != bid
+            if gone:
+                meta_update(job, state="failed", failure="lost")
+                continue
+        keep.append(s)
+    return keep
+
+
+# ---------------------------------------------------------------- 동사
+
+def v_hello(origin: str, args: list[str]) -> None:
+    cfg = load_config()
+    emit({"ok": True, "proto": PROTO, "bundle_version": cfg["bundle_version"], "gjc": installed_gjc(),
+          "ncpu": os.cpu_count(), "host": os.uname().nodename, "origin": origin})
+
+
+def v_probe(origin: str, args: list[str]) -> None:
+    cfg = load_config()
+    model = None
+    repo = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--model":
+            model = need("model", args[i + 1]); i += 2
+        elif args[i] == "--repo":
+            repo = need("repo", args[i + 1]); i += 2
+        else:
+            raise HelperError("bad_argument", args[i], 64)
+    with Flock(SLOTS_LOCK):
+        slots = slots_load()
+    # 읽기 전용 계산: 다음 reserve가 회수할 슬롯(lease 만료·종료 표식)은 쓰는 수에서 뺀다.
+    t = now()
+    live = [s for s in slots if not os.path.exists(ended_marker(s["job"], s["gen"]))
+            and not (s["state"] in ("reserved", "staged") and s["lease_until"] < t)]
+    snap = load_snapshot()
+    res = {"ok": True, "snapshot": snap, "slots_used": len(live), "slots_max": cfg["max_slots"],
+           "load_max": cfg["load_max"], "gjc": installed_gjc(), "trusted_gjc": sorted(trusted_gjc()),
+           "credential": os.path.exists(KEY_FILE), "bundle_version": cfg["bundle_version"],
+           "admission": admission(cfg)}
+    if model:
+        res["model_rejection"] = model_check(cfg, model)
+    if repo:
+        cache = os.path.join(REPOS, f"{repo}.git")
+        held = []
+        if os.path.isdir(cache):
+            proc = worktool(["held", repo], None, timeout=60)
+            if proc.returncode == 0:
+                held = json.loads(proc.stdout.decode().strip().splitlines()[-1]).get("held", [])
+        res["held"] = held
+    emit(res)
+
+
+def admission(cfg: dict) -> list[str]:
+    snap = load_snapshot()
+    reasons = []
+    if snap["load_ratio"] >= cfg["load_max"]:
+        reasons.append("remote_overloaded")
+    if snap["psi_mem"] is not None and snap["psi_mem"] > cfg["psi_mem_max"]:
+        reasons.append("remote_overloaded")
+    if snap["disk_free_gb"] < cfg["disk_min_gb"]:
+        reasons.append("disk_low")
+    if cfg.get("contention_slice") and (snap.get("contention_psi") or 0) > cfg["contention_psi_max"]:
+        reasons.append(f"contention:{cfg['contention_slice']}")
+    return sorted(set(reasons))
+
+
+def v_reserve(origin: str, args: list[str]) -> None:
+    if len(args) != 6:
+        raise HelperError("bad_argument", "reserve", 64)
+    job, gen_s, est_s, session, ver, model = args
+    need("job", job); need("gen", gen_s); need("num", est_s); need("session", session)
+    need("version", ver); need("model", model)
+    gen, est = int(gen_s), int(est_s)
+    check_reg(origin)
+    cfg = load_config()
+    sdir = job_state_dir(job)
+    ensure_root_dir(os.path.join(STATE, "jobs"))
+    meta = read_root_json(os.path.join(sdir, "meta.json"))
+    if meta is not None:
+        if meta["origin"] != origin or meta["main_session"] != session or meta["gen"] != gen:
+            raise HelperError("job_conflict", status=3)
+        emit({"ok": True, "duplicate": True, "cap": cap_token(origin, session, job, gen),
+              "gjc_installed": gjc_binary_ok(ver), "state": meta.get("state")})
+        return
+    rej = model_check(cfg, model)
+    if rej:
+        raise HelperError(rej, status=3)
+    if ver not in trusted_gjc():
+        raise HelperError("gjc_version_untrusted", ver, 3)
+    if not os.path.exists(KEY_FILE):
+        raise HelperError("credential_missing", status=3)
+    with Flock(SLOTS_LOCK):
+        slots = reclaim(slots_load())
+        if len(slots) >= cfg["max_slots"]:
+            slots_save(slots)
+            raise HelperError("slots_full", status=3)
+        reasons = admission(cfg)
+        if reasons:
+            slots_save(slots)
+            raise HelperError(reasons[0], ",".join(reasons), 3)
+        ensure_root_dir(sdir)
+        write_root_json(os.path.join(sdir, "meta.json"), {
+            "job": job, "gen": gen, "origin": origin, "main_session": session, "est_min": est, "model": model,
+            "gjc_version": ver, "bundle_version": cfg["bundle_version"], "state": "reserved", "created": iso()})
+        slots.append({"job": job, "gen": gen, "state": "reserved", "lease_until": now() + cfg["lease_s"],
+                      "main_session": session, "origin": origin, "invocation": None, "boot_id": None})
+        slots_save(slots)
+    emit({"ok": True, "duplicate": False, "cap": cap_token(origin, session, job, gen),
+          "gjc_installed": gjc_binary_ok(ver), "lease_s": cfg["lease_s"]})
+
+
+def extend_lease(job: str, gen: int, state: str | None = None) -> None:
+    cfg = load_config()
+    with Flock(SLOTS_LOCK):
+        slots = slots_load()
+        found = False
+        for s in slots:
+            if s["job"] == job and s["gen"] == gen and s["state"] in ("reserved", "staged"):
+                s["lease_until"] = now() + cfg["lease_s"]
+                if state:
+                    s["state"] = state
+                found = True
+        if not found:
+            raise HelperError("slot_missing", status=3)
+        slots_save(slots)
+
+
+def ensure_work_dir(job: str) -> None:
+    root_parent = WORK
+    st = os.lstat(root_parent)
+    if st.st_uid != 0 or os.path.islink(root_parent):
+        raise HelperError("state_untrusted", WORK)
+    path = os.path.join(WORK, need("job", job))
+    if not os.path.lexists(path):
+        os.mkdir(path, 0o700)
+        u = run_user()
+        os.chown(path, u.pw_uid, u.pw_gid)
+
+
+def v_upload_base(origin: str, args: list[str]) -> None:
+    job = need("job", args[0]) if len(args) == 1 else None
+    if not job:
+        raise HelperError("bad_argument", "upload-base", 64)
+    meta = check_cap(origin, job)
+    if os.path.exists(os.path.join(job_state_dir(job), f"sealed-g{meta['gen']}")):
+        raise HelperError("sealed", status=3)
+    extend_lease(job, meta["gen"])
+    ensure_work_dir(job)
+    emit(worktool_json(["write-base", job], job, stdin=sys.stdin.buffer, timeout=3600,
+                       bundle_version=meta["bundle_version"]))
+
+
+def v_prepare(origin: str, args: list[str]) -> None:
+    if len(args) != 2:
+        raise HelperError("bad_argument", "prepare", 64)
+    job, gen = need("job", args[0]), int(need("gen", args[1]))
+    meta = check_cap(origin, job)
+    if meta["gen"] != gen:
+        raise HelperError("gen_mismatch", status=3)
+    if os.path.exists(os.path.join(job_state_dir(job), f"sealed-g{gen}")):
+        raise HelperError("sealed", status=3)
+    raw = sys.stdin.buffer.read(256 * 1024 + 1)
+    if len(raw) > 256 * 1024:
+        raise HelperError("payload_too_large", status=3)
+    manifest = json.loads(raw)
+    if not isinstance(manifest, dict):
+        raise HelperError("bad_manifest", status=3)
+    need("repo", manifest.get("repo_id", ""))
+    if not re.match(r"^([0-9a-f]{40}|[0-9a-f]{64})$", str(manifest.get("base_sha", ""))):
+        raise HelperError("bad_manifest", "base_sha", 3)
+    checks = manifest.get("checks") or []
+    if not isinstance(checks, list) or len(checks) > 10:
+        raise HelperError("bad_manifest", "checks", 3)
+    for c in checks:
+        if not (isinstance(c, dict) and re.match(r"^[a-z0-9_-]{1,32}$", str(c.get("id", ""))) and isinstance(c.get("cmd"), str)
+                and len(c["cmd"]) <= 2000):
+            raise HelperError("bad_manifest", "check", 3)
+    if not isinstance(manifest.get("task_md"), str) or len(manifest["task_md"]) > 200_000:
+        raise HelperError("bad_manifest", "task_md", 3)
+    extend_lease(job, gen)
+    ensure_work_dir(job)
+    full = {"repo_id": manifest["repo_id"], "base_sha": manifest["base_sha"], "task_md": manifest["task_md"],
+            "checks": checks, "verify": "off" if manifest.get("verify") == "off" else "runner",
+            "job": job, "gen": gen, "model": meta["model"], "est_min": meta["est_min"], "gjc_version": meta["gjc_version"]}
+    res = worktool_input(["prepare", job], job, json.dumps(full).encode(), meta["bundle_version"])
+    extend_lease(job, gen, "staged")
+    meta_update(job, state="staged", repo_id=manifest["repo_id"])
+    emit(res)
+
+
+def v_install_gjc(origin: str, args: list[str]) -> None:
+    if len(args) != 2:
+        raise HelperError("bad_argument", "install-gjc", 64)
+    ver, sha = need("version", args[0]), need("sha256", args[1])
+    check_reg(origin)
+    want = trusted_gjc().get(ver)
+    if want != sha:
+        raise HelperError("gjc_version_untrusted", ver, 3)
+    if gjc_binary_ok(ver):
+        sys.stdin.buffer.read()
+        emit({"ok": True, "already": True})
+        return
+    d = os.path.join(LIB, "gjc", ver)
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    os.chmod(d, 0o755)  # umask 077 아래에서 만들어져도 실행 계정이 읽고 실행할 수 있게
+    tmp = os.path.join(d, f".gjc.tmp{os.getpid()}")
+    h = hashlib.sha256()
+    total = 0
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o755)
+    with os.fdopen(fd, "wb") as f:
+        while True:
+            chunk = sys.stdin.buffer.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 600 << 20:
+                os.unlink(tmp)
+                raise HelperError("payload_too_large", status=3)
+            h.update(chunk)
+            f.write(chunk)
+    if h.hexdigest() != sha:
+        os.unlink(tmp)
+        raise HelperError("gjc_hash_mismatch", status=3)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, os.path.join(d, "gjc"))
+    emit({"ok": True, "already": False, "bytes": total})
+
+
+def v_launch(origin: str, args: list[str]) -> None:
+    if len(args) != 2:
+        raise HelperError("bad_argument", "launch", 64)
+    job, gen = need("job", args[0]), int(need("gen", args[1]))
+    meta = check_cap(origin, job)
+    if meta["gen"] != gen:
+        raise HelperError("gen_mismatch", status=3)
+    cfg = load_config()
+    unit = unit_name(job, gen)
+    with Flock(os.path.join(job_state_dir(job), "lock")):
+        if os.path.exists(os.path.join(job_state_dir(job), f"sealed-g{gen}")):
+            raise HelperError("sealed", status=3)
+        with Flock(SLOTS_LOCK):
+            slots = slots_load()
+            slot = next((s for s in slots if s["job"] == job and s["gen"] == gen), None)
+        if slot is None:
+            raise HelperError("slot_missing", status=3)
+        if slot["state"] == "launched":
+            emit({"ok": True, "already": True, "unit": unit, "invocation": slot.get("invocation")})
+            return
+        if slot["state"] != "staged":
+            raise HelperError("not_staged", slot["state"], 3)
+        if not gjc_binary_ok(meta["gjc_version"]):
+            raise HelperError("gjc_hash_mismatch", status=3)
+        if not os.path.exists(KEY_FILE):
+            raise HelperError("credential_missing", status=3)
+        w = os.path.join(WORK, job)
+        bundle = os.path.join(LIB, "bundle", meta["bundle_version"])
+        # 슬롯별 빌드 캐시(계획 위험 5): 같은 저장소의 다른 활성 슬롯이 쓰지 않는 가장 작은 번호를 이 잡이 슬롯을
+        # 반납할 때까지 쓴다. 동시에 도는 잡끼리 target/을 덮어쓰지 않고, 다음 잡은 앞 잡의 빌드를 이어 쓴다(웜).
+        repo_id = meta.get("repo_id") or ""
+        cache_slot = None
+        target_dir = None
+        if re.match(r"^[0-9a-f]{16,64}$", repo_id):
+            with Flock(SLOTS_LOCK):
+                slots = slots_load()
+                used = {x.get("cache_slot") for x in slots
+                        if x.get("repo_id") == repo_id and not (x["job"] == job and x["gen"] == gen)}
+                cache_slot = next(k for k in range(len(slots) + 1) if k not in used)
+                for x in slots:
+                    if x["job"] == job and x["gen"] == gen:
+                        x.update(repo_id=repo_id, cache_slot=cache_slot)
+                slots_save(slots)
+            target_dir = os.path.join(SHARED_CACHE, "target", repo_id, f"s{cache_slot}")
+            ru = run_user()
+            for d in (os.path.join(SHARED_CACHE, "target"), os.path.join(SHARED_CACHE, "target", repo_id), target_dir):
+                if not os.path.isdir(d):
+                    os.mkdir(d, 0o700)
+                    os.chown(d, ru.pw_uid, ru.pw_gid)
+        runtime = min(int(meta["est_min"]) * 2, 480) * 60
+        env = {
+            "HOME": f"{w}/home", "XDG_CACHE_HOME": f"{w}/cache", "TMPDIR": f"{w}/tmp",
+            "GJC_CODING_AGENT_DIR": f"{w}/agent", "GJC_RT_JOB_DIR": w, "GJC_RT_JOB": f"{job}-g{gen}",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": f"{bundle}/gitconfig",
+            "CARGO_BUILD_JOBS": str(cfg["cargo_jobs"]), "CARGO_HOME": f"{SHARED_CACHE}/cargo",
+            "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8",
+        }
+        if target_dir:
+            env["CARGO_TARGET_DIR"] = target_dir
+        # bun 설치 캐시도 cargo 레지스트리처럼 잡 사이에 공유한다(잡 HOME은 잡마다 새로 만들어져 늘 콜드가 된다).
+        bun_cache = os.path.join(SHARED_CACHE, "bun")
+        if not os.path.isdir(bun_cache):
+            ru = run_user()
+            os.mkdir(bun_cache, 0o700)
+            os.chown(bun_cache, ru.pw_uid, ru.pw_gid)
+        env["BUN_INSTALL_CACHE_DIR"] = bun_cache
+        cmd = ["systemd-run", f"--unit={unit}", f"--slice=user-{run_user().pw_uid}.slice", f"--uid={RUN_USER}", f"--gid={RUN_USER}",
+               "--collect", "-p", "Type=exec", "-p", "KillMode=control-group", "-p", "TimeoutStopSec=180",
+               "-p", f"RuntimeMaxSec={runtime}", "-p", f"MemoryMax={cfg['job_memory_max']}",
+               "-p", f"TasksMax={cfg['job_tasks_max']}", "-p", "ProtectSystem=strict",
+               "-p", f"ReadWritePaths={w} {SHARED_CACHE}", "-p", f"InaccessiblePaths={STATE} {PRIV}",
+               "-p", "PrivateTmp=yes", "-p", "NoNewPrivileges=yes", "-p", "StandardOutput=null",
+               "-p", "StandardError=null", "-p", f"LoadCredential=gjc-rt-key:{KEY_FILE}",
+               "-p", f"WorkingDirectory={w}",
+               "-p", f"ExecStopPost=+/usr/bin/python3 {LIB}/rt-helper --internal finalize {job} {gen}"]
+        for k, v in env.items():
+            cmd.append(f"--setenv={k}={v}")
+        cmd += ["--", "/usr/bin/python3", f"{bundle}/rt-runner.py", job, str(gen)]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        info = unit_show(unit)
+        if proc.returncode != 0 and info.get("LoadState") != "loaded":
+            raise HelperError("launch_failed", proc.stderr.decode("utf-8", "replace")[-300:], 3)
+        with Flock(SLOTS_LOCK):
+            slots = slots_load()
+            for s in slots:
+                if s["job"] == job and s["gen"] == gen:
+                    s.update(state="launched", invocation=info.get("InvocationID"), boot_id=boot_id())
+            slots_save(slots)
+        meta_update(job, state="launched", invocation=info.get("InvocationID"), launched=iso())
+    emit({"ok": True, "already": proc.returncode != 0, "unit": unit, "invocation": info.get("InvocationID")})
+
+
+def v_status(origin: str, args: list[str]) -> None:
+    job = need("job", args[0]) if len(args) == 1 else None
+    if not job:
+        raise HelperError("bad_argument", "status", 64)
+    meta = check_cap(origin, job)
+    gen = meta["gen"]
+    unit = unit_show(unit_name(job, gen))
+    ended = read_root_json(ended_marker(job, gen))
+    res = {"ok": True, "job": job, "gen": gen, "state": meta.get("state"), "failure": meta.get("failure"),
+           "unit": {k: unit.get(k) for k in ("LoadState", "ActiveState", "SubState", "InvocationID", "Result")},
+           "invocation": meta.get("invocation"), "ended": ended,
+           "sealed": os.path.exists(os.path.join(job_state_dir(job), f"sealed-g{gen}")),
+           "cleaned": os.path.exists(os.path.join(job_state_dir(job), "cleaned"))}
+    if not res["cleaned"] and os.path.isdir(os.path.join(WORK, job)):
+        try:
+            res["work"] = worktool_json(["status", job], job, timeout=60, bundle_version=meta["bundle_version"])
+        except HelperError as exc:
+            res["work_error"] = exc.code
+    emit(res)
+
+
+def v_events(origin: str, args: list[str]) -> None:
+    if len(args) < 2:
+        raise HelperError("bad_argument", "events", 64)
+    job, after = need("job", args[0]), need("seq", args[1])
+    wait, max_n = "0", "200"
+    rest = args[2:]
+    while rest:
+        if rest[0] == "--wait":
+            wait = need("num", rest[1]); rest = rest[2:]
+        elif rest[0] == "--max":
+            max_n = need("num", rest[1]); rest = rest[2:]
+        else:
+            raise HelperError("bad_argument", rest[0], 64)
+    meta = check_cap(origin, job)
+    if os.path.exists(os.path.join(job_state_dir(job), "cleaned")):
+        raise HelperError("job_cleaned", status=3)
+    emit(worktool_json(["events", job, after, str(min(int(wait), 50)), str(min(int(max_n), 500))], job, timeout=90,
+                       bundle_version=meta["bundle_version"]))
+
+
+def v_send(origin: str, args: list[str]) -> None:
+    if len(args) != 3:
+        raise HelperError("bad_argument", "send", 64)
+    job, msgid, reply_to = need("job", args[0]), need("msgid", args[1]), need("replyto", args[2])
+    meta = check_cap(origin, job)
+    unit = unit_show(unit_name(job, meta["gen"]))
+    if unit.get("ActiveState") not in ("active", "activating"):
+        raise HelperError("job_not_running", status=3)
+    data = sys.stdin.buffer.read(64 * 1024 + 1)
+    if len(data) > 64 * 1024:
+        raise HelperError("payload_too_large", status=3)
+    emit(worktool_input(["inbox-append", job, msgid, reply_to], job, data, meta["bundle_version"], timeout=60))
+
+
+def v_bundle(origin: str, args: list[str]) -> None:
+    job = need("job", args[0]) if len(args) == 1 else None
+    if not job:
+        raise HelperError("bad_argument", "bundle", 64)
+    meta = check_cap(origin, job)
+    worktool_stream(["bundle", job], job, meta["bundle_version"])
+
+
+def v_logs(origin: str, args: list[str]) -> None:
+    job = need("job", args[0]) if len(args) == 1 else None
+    if not job:
+        raise HelperError("bad_argument", "logs", 64)
+    meta = check_cap(origin, job)
+    worktool_stream(["logs", job], job, meta["bundle_version"])
+
+
+def v_cancel(origin: str, args: list[str]) -> None:
+    if len(args) != 2:
+        raise HelperError("bad_argument", "cancel", 64)
+    job, gen = need("job", args[0]), int(need("gen", args[1]))
+    meta = check_cap(origin, job)
+    if meta["gen"] != gen:
+        raise HelperError("gen_mismatch", status=3)
+    unit = unit_name(job, gen)
+    with Flock(os.path.join(job_state_dir(job), "lock")):
+        seal(job, gen, "cancel")
+        info = unit_show(unit)
+        if info.get("LoadState") == "loaded" and info.get("ActiveState") in ("active", "activating", "deactivating"):
+            subprocess.run(["systemctl", "stop", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        else:
+            # 시작 전 취소: 슬롯을 바로 반납한다.
+            with Flock(SLOTS_LOCK):
+                slots = [s for s in slots_load() if not (s["job"] == job and s["gen"] == gen and s["state"] in ("reserved", "staged"))]
+                slots_save(slots)
+            if meta.get("state") in ("reserved", "staged"):
+                meta_update(job, state="failed", failure="cancelled_before_launch")
+    emit({"ok": True, "sealed": True, "unit": unit_show(unit).get("ActiveState"),
+          "ended": read_root_json(ended_marker(job, gen))})
+
+
+def do_cleanup(job: str, meta: dict) -> dict:
+    unit = unit_show(unit_name(job, meta["gen"]))
+    if unit.get("ActiveState") in ("active", "activating", "deactivating"):
+        raise HelperError("job_running", status=3)
+    sdir = job_state_dir(job)
+    if os.path.exists(os.path.join(sdir, "cleaned")):
+        return {"ok": True, "already": True}
+    w = os.path.join(WORK, job)
+    if os.path.lexists(w):
+        if os.path.islink(w) or not os.path.isdir(w):
+            raise HelperError("state_untrusted", "work", 3)
+        worktool_json(["cleanup", job], job, timeout=1800, bundle_version=meta["bundle_version"])
+        os.rmdir(w)
+    with Flock(SLOTS_LOCK):
+        slots = [s for s in slots_load() if s["job"] != job]
+        slots_save(slots)
+    write_root_json(os.path.join(sdir, "cleaned"), {"at": iso()})
+    meta_update(job, cleaned=iso())
+    return {"ok": True, "already": False}
+
+
+def v_cleanup(origin: str, args: list[str]) -> None:
+    job = need("job", args[0]) if len(args) == 1 else None
+    if not job:
+        raise HelperError("bad_argument", "cleanup", 64)
+    meta = check_cap(origin, job)
+    emit(do_cleanup(job, meta))
+
+
+# ---------------------------------------------------------------- 내부 전용
+
+def internal_finalize(job: str, gen_s: str) -> int:
+    """ExecStopPost(root). ended 표식 → 슬롯 반납 → 권한을 내린 마무리(최선 노력)."""
+    need("job", job)
+    gen = int(need("gen", gen_s))
+    marker = ended_marker(job, gen)
+    if not os.path.exists(marker):
+        write_root_json(marker, {"at": iso(), "service_result": os.environ.get("SERVICE_RESULT"),
+                                 "exit_code": os.environ.get("EXIT_CODE"), "exit_status": os.environ.get("EXIT_STATUS")})
+    with Flock(SLOTS_LOCK):
+        slots = [s for s in slots_load() if not (s["job"] == job and s["gen"] == gen)]
+        slots_save(slots)
+    meta = read_root_json(os.path.join(job_state_dir(job), "meta.json")) or {}
+    meta_update(job, state="ended", ended=iso())
+    try:
+        worktool(["finish", job, "forced"], job, timeout=150, bundle_version=meta.get("bundle_version"))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return 0
+
+
+def internal_gc() -> int:
+    jobs_root = os.path.join(STATE, "jobs")
+    try:
+        names = os.listdir(jobs_root)
+    except FileNotFoundError:
+        return 0
+    for job in names:
+        if not RX["job"].match(job):
+            continue
+        meta = read_root_json(os.path.join(jobs_root, job, "meta.json"))
+        if not meta or os.path.exists(os.path.join(jobs_root, job, "cleaned")):
+            continue
+        ended = read_root_json(ended_marker(job, meta["gen"]))
+        age_ref = None
+        if ended:
+            age_ref = ended.get("at")
+        elif meta.get("state") == "failed":
+            age_ref = meta.get("created")
+        if not age_ref:
+            continue
+        t = time.mktime(time.strptime(age_ref, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        if now() - t > 7 * 86400:
+            try:
+                do_cleanup(job, meta)
+            except HelperError:
+                pass
+    return 0
+
+
+VERBS = {
+    "hello": v_hello, "probe": v_probe, "reserve": v_reserve, "upload-base": v_upload_base,
+    "prepare": v_prepare, "install-gjc": v_install_gjc, "launch": v_launch, "status": v_status,
+    "events": v_events, "send": v_send, "bundle": v_bundle, "logs": v_logs, "cancel": v_cancel,
+    "cleanup": v_cleanup,
+}
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o077)
+    try:
+        if len(argv) >= 2 and argv[1] == "--internal":
+            if os.environ.get("SUDO_USER"):
+                raise HelperError("internal_only", status=77)
+            if argv[2] == "finalize" and len(argv) == 5:
+                return internal_finalize(argv[3], argv[4])
+            if argv[2] == "gc" and len(argv) == 3:
+                return internal_gc()
+            raise HelperError("bad_argument", "internal", 64)
+        if len(argv) < 4 or argv[1] != "--origin":
+            raise HelperError("bad_argument", "usage", 64)
+        origin = need("origin", argv[2])
+        verb = argv[3]
+        fn = VERBS.get(verb)
+        if fn is None:
+            raise HelperError("unknown_verb", status=64)
+        fn(origin, argv[4:])
+        return 0
+    except HelperError as exc:
+        sys.stderr.write(json.dumps({"error": exc.code, "detail": exc.detail}, ensure_ascii=False) + "\n")
+        return exc.status
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(json.dumps({"error": "timeout"}) + "\n")
+        return 3
+    except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        sys.stderr.write(json.dumps({"error": "helper_failed", "detail": type(exc).__name__}) + "\n")
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

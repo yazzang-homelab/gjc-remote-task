@@ -1,0 +1,15 @@
+{
+ "max_slots": 2,
+ "load_max": 0.7,
+ "disk_min_gb": 5,
+ "job_memory_max": "4G",
+ "job_tasks_max": 2048,
+ "cargo_jobs": 4,
+ "psi_mem_max": 10.0,
+ "contention_slice": null,
+ "contention_psi_max": 10.0,
+ "lease_s": 900,
+ "provider": "my-hub",
+ "allowed_models": ["my-hub/my-model"],
+ "hub_models_url": "https://hub.example.com/v1/models"
+}

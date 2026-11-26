@@ -1,0 +1,16 @@
+[user]
+	name = gjc-rt
+	email = gjc-rt@invalid
+[core]
+	hooksPath = /dev/null
+	fsmonitor = false
+[protocol "ext"]
+	allow = never
+[protocol "file"]
+	allow = never
+[submodule]
+	recurse = false
+[commit]
+	gpgsign = false
+[safe]
+	directory = *

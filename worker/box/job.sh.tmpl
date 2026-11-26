@@ -1,0 +1,41 @@
+#!/bin/bash
+# gjc-rt 박스 잡 @JOB@ g@GEN@. instabox-q 대기줄 작업으로 박스 user가 실행한다.
+# 관리 단계만 sudo로 rt-boxctl(root)에 맡기고, 러너는 scope 안에서 rtrun으로 돈다(계획 §19.2·§20~§23).
+set -uo pipefail
+JOB=@JOB@
+GEN=@GEN@
+IN=/data/workspace/rt-in/$JOB
+BIN=/data/rt-ctl/bin/rt-boxctl
+U=rt-${JOB#rt-}-g$GEN
+log() { echo "[rt-job] $(date -u +%H:%M:%S) $*"; }
+
+# 1. rt-boxctl: root 영역에 먼저 복사한 뒤 그 사본의 해시를 본다(검사와 사용 사이 교체 방지).
+sudo -n install -d -m 0700 -o root -g root /data/rt-ctl /data/rt-ctl/bin || { log setup_denied; exit 90; }
+sudo -n install -m 0700 -o root -g root "$IN/rt-boxctl" "$BIN.new" || { log boxctl_copy_failed; exit 90; }
+if ! echo "@BOXCTL_SHA@  $BIN.new" | sudo -n sha256sum -c --status; then
+  sudo -n rm -f "$BIN.new"; log boxctl_hash_mismatch; exit 91
+fi
+sudo -n mv -f "$BIN.new" "$BIN"
+
+# 2. 묶음·gjc 설치(해시 확인), 작업 영역 준비(공개 원본 익명 clone + 미push bundle).
+sudo -n "$BIN" setup "$IN/bundle.tar" @BUNDLE_VER@ @TAR_SHA@ @GJC_VER@ @GJC_SHA@ || { log setup_failed; exit 92; }
+sudo -n "$BIN" prepare "$JOB" "$GEN" "$IN" @BUNDLE_VER@ || { log prepare_failed; exit 93; }
+
+# 3. 실행. ctl 유닛이 시작 시도 전체를 추적한다(§22.3). systemd-run --wait는 신호를 받아도 유닛을 멈추지
+#    않으므로(M0 실측) 취소·시간 초과 때는 trap이 두 유닛을 직접 멈춘다(§23.2).
+on_term() {
+  log term
+  sudo -n systemctl stop "$U.scope" "$U-ctl.service" 2>/dev/null
+  sudo -n "$BIN" collect-prep "$JOB" cancelled
+  exit 143
+}
+trap on_term TERM INT
+sudo -n systemd-run --unit="$U-ctl" --collect --wait --quiet -p KillMode=control-group -- "$BIN" start-inner "$JOB" "$GEN" &
+wait $!
+rc=$?
+log "ctl exit $rc"
+
+# 4. 결과를 root 소유 out/에 모은다(메인 호스트 pump가 instabox-q fetch로 가져간다). 7일 지난 잡 정리.
+sudo -n "$BIN" collect-prep "$JOB" completed
+sudo -n "$BIN" gc > /dev/null
+exit $rc

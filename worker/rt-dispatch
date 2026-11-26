@@ -1,0 +1,35 @@
+#!/usr/bin/python3
+"""gjc-rt forced command. 진입 계정 gjcrt-ctl로 돈다.
+
+SSH_ORIGINAL_COMMAND를 셸 없이 나누고 토큰 문법만 확인한 뒤 sudo로 rt-helper를 부른다.
+실제 인가(토큰·원장)는 rt-helper가 한다. origin은 authorized_keys의 command=에서만 온다.
+"""
+import os
+import re
+import sys
+
+VERBS = {"hello", "probe", "reserve", "upload-base", "prepare", "install-gjc", "launch", "status",
+         "events", "send", "bundle", "logs", "cancel", "cleanup"}
+TOKEN = re.compile(r"^[A-Za-z0-9._:/@+-]{1,120}$")
+# 원점 이름. 실제 인가는 rt-helper가 원점별 등록 토큰(/etc/gjc-rt/private/hosts/<원점>.token)으로 한다.
+ORIGIN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
+def deny(code: str) -> None:
+    sys.stderr.write('{"error": "%s"}\n' % code)
+    sys.exit(64)
+
+
+def main() -> None:
+    if len(sys.argv) != 3 or sys.argv[1] != "--origin" or not ORIGIN.match(sys.argv[2]):
+        deny("bad_origin")
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    if not raw or len(raw) > 512:
+        deny("bad_command")
+    parts = raw.split(" ")
+    if parts[0] not in VERBS or any(not TOKEN.match(p) for p in parts[1:]):
+        deny("bad_command")
+    os.execv("/usr/bin/sudo", ["sudo", "-n", "/usr/local/lib/gjc-rt/rt-helper", "--origin", sys.argv[2], *parts])
+
+
+main()
